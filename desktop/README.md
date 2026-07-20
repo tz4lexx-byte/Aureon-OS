@@ -14,3 +14,9 @@ escritorio sin configurar nada en tu PC.
 Usa `tools/aureon-desktop-preview --dry-run` para inspeccionar el plan o
 consulta [la guía de uso](../docs/testing/desktop-preview.md) para la orden de
 PowerShell que abre la ventana de QEMU mediante WSLg.
+
+La siguiente reconstrucción de la imagen incluirá `aureonctl` y los accesos
+`aureon-hardware`, `aureon-driver`, `aureon-resource` y `aureon-integrity`.
+Todos empiezan como diagnósticos o planes locales; no instalan controladores,
+no aplican límites de recursos, no transmiten datos ni realizan cambios de
+disco.

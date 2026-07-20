@@ -1,0 +1,3 @@
+#!/bin/sh
+# Local inspection only; it cannot install or change a driver.
+exec /usr/bin/aureonctl driver "$@"

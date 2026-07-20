@@ -1,0 +1,3 @@
+#!/bin/sh
+# Integrity Basic stays local and does not transmit diagnostics.
+exec /usr/bin/aureonctl integrity "$@"

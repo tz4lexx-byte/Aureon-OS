@@ -50,6 +50,21 @@ Si el backend gráfico no está disponible, instala dentro de Ubuntu WSL el
 paquete `qemu-system-gui` y vuelve a ejecutar la orden. No hace falta tocar el
 BIOS ni instalar un sistema operativo en el disco del PC.
 
+## Abrir una preview ya creada, sin recompilar
+
+Si ya existe una conversión validada, por ejemplo `preview-09`, no hace falta
+volver a descargar paquetes ni crear otro disco base. Esta orden genera solo
+un overlay virtual nuevo para esa sesión y abre la ventana:
+
+```powershell
+wsl.exe -d Ubuntu-24.04 --cd /mnt/c/Users/pc/Documents/Codex/2026-07-18/aureon-os -- bash -lc 'sudo -E /usr/bin/python3 tools/aureon-desktop-preview --run-existing --build-id preview-09 --session-id aur-01 --execute'
+```
+
+No uses `--allow-build-network` con `--run-existing`: no descarga ni construye
+nada. Para otra sesión cambia únicamente `--session-id`, por ejemplo
+`aur-02`. La imagen base queda de solo lectura y el estado de la sesión vive
+en `work/qemu-desktop/preview-09/sessions/aur-01/`.
+
 ## Límites de esta fase
 
 - Es una preview de desarrollo, no una versión para instalar en hardware real.

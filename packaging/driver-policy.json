@@ -1,0 +1,20 @@
+{
+  "schema": "aureon.driver-policy",
+  "version": 1,
+  "channels": ["stable", "performance", "compatibility", "legacy", "experimental"],
+  "manifest_required_fields": [
+    "hardware_ids",
+    "kernel_range",
+    "firmware",
+    "components_64",
+    "components_32",
+    "secure_boot",
+    "known_issues",
+    "tests",
+    "rollback",
+    "channel"
+  ],
+  "automatic_selection": "only-installed-signed-unequivocal-match",
+  "confirmation_required": ["install-proprietary", "change-channel", "downgrade", "reboot"],
+  "rollback": "only-after-demonstrated-boot-or-graphics-failure"
+}

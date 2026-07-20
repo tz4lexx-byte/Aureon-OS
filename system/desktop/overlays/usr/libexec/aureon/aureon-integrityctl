@@ -1,0 +1,3 @@
+#!/bin/sh
+# Compatibility command for the Integrity control-plane entry point.
+exec /usr/bin/aureonctl integrity "$@"

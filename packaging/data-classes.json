@@ -1,0 +1,20 @@
+{
+  "schema": "aureon.data-classes",
+  "version": 1,
+  "classes": {
+    "system-image": "ESENCIAL",
+    "user-configuration": "RESPALDABLE",
+    "application-data": "RESPALDABLE",
+    "games": "RESPALDABLE",
+    "saved-games": "RESPALDABLE",
+    "mods": "RESPALDABLE",
+    "proton-prefixes": "RESPALDABLE",
+    "shader-cache": "REGENERABLE",
+    "package-cache": "REGENERABLE",
+    "temporary-files": "TEMPORAL",
+    "recordings": "RESPALDABLE",
+    "documents": "DESCONOCIDO"
+  },
+  "automatic_cleanup_permitted_only_for": ["REGENERABLE", "TEMPORAL"],
+  "confirmation_required_for": ["ESENCIAL", "RESPALDABLE", "DESCONOCIDO"]
+}

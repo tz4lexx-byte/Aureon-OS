@@ -25,7 +25,11 @@ RUN mkdir -p /var/roothome && \
       kwin-wayland \
       xdg-desktop-portal-kde \
       mesa-dri-drivers \
+      pciutils \
       pipewire \
+      python3 \
+      usbutils \
+      vulkan-tools \
       wireplumber \
       dolphin \
       konsole && \
@@ -39,6 +43,9 @@ COPY overlays/ /
 # boot, so no PC password, guest password, SSH key, or remote login is needed.
 RUN useradd --create-home --uid 1000 --shell /bin/bash aureon && \
     passwd --lock aureon && \
+    install -d -m 0755 /usr/bin && \
+    chmod 0755 /usr/libexec/aureon/aureon-baseline /usr/libexec/aureon/aureonctl /usr/libexec/aureon/aureon-hardware /usr/libexec/aureon/aureon-driver /usr/libexec/aureon/aureon-resource /usr/libexec/aureon/aureon-integrity /usr/libexec/aureon/aureon-integrityctl && \
+    for command in aureonctl aureon-hardware aureon-driver aureon-resource aureon-integrity aureon-integrityctl; do ln -s ../libexec/aureon/${command} /usr/bin/${command}; done && \
     install -d -m 0755 /usr/lib/systemd/system/multi-user.target.wants && \
     ln -s ../greetd.service /usr/lib/systemd/system/multi-user.target.wants/greetd.service && \
     ln -s ../aureon-desktop-ready.service /usr/lib/systemd/system/multi-user.target.wants/aureon-desktop-ready.service

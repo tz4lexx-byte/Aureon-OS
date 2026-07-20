@@ -1,0 +1,20 @@
+{
+  "schema": "aureon.service-classes",
+  "version": 1,
+  "classes": {
+    "essential-at-boot": ["systemd", "dbus", "greetd", "pipewire", "wireplumber", "NetworkManager"],
+    "hardware-activated": ["bluetooth", "fwupd"],
+    "socket-activated": ["user-session-services"],
+    "application-activated": ["tracker", "thumbnailers", "portal-backends"],
+    "gaming-session-only": ["gamemoded", "gamescope-session", "aureon-gaming"],
+    "streaming-session-only": ["obs-studio", "aureon-streaming"],
+    "competitive-session-only": ["aureon-integrity"],
+    "optional": ["flatpak-system-helper", "printing"],
+    "not-enabled-by-default": ["automatic-firmware-update", "remote-diagnostics-export"]
+  },
+  "rules": [
+    "A session-only service must not be enabled at boot.",
+    "A service that needs a microphone, camera, network export or firmware write requires a separate user action.",
+    "The resource planner may defer work; it never terminates an interactive process."
+  ]
+}

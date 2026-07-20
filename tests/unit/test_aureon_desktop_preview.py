@@ -6,6 +6,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import errno
 import sys
 import tempfile
 import unittest
@@ -85,6 +86,46 @@ class DesktopPreviewTests(unittest.TestCase):
         self.assertEqual(paths.work_root, root / "work" / "qemu-desktop" / "demo")
         self.assertEqual(paths.disk.suffix, ".qcow2")
 
+    def test_existing_preview_uses_a_new_session_overlay_below_its_virtual_work_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            paths = self.tool.existing_session_paths("demo", "resume-01", root)
+
+        self.assertEqual(paths.session_root, root / "work" / "qemu-desktop" / "demo" / "sessions" / "resume-01")
+        self.assertEqual(paths.overlay.name, "desktop-overlay.qcow2")
+        self.assertEqual(paths.serial_log.parent, paths.session_root)
+
+    def test_existing_preview_dry_run_needs_no_build_network_or_new_image(self):
+        build_id = "existing-unit-" + uuid.uuid4().hex[:10]
+        status, output = self.invoke(["--run-existing", "--build-id", build_id, "--session-id", "resume-01"])
+        plan = json.loads(output)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(plan["command"], "desktop-preview --run-existing")
+        self.assertEqual(plan["execution"]["build_network"], "not used")
+        self.assertTrue(plan["safety"]["base_qcow2_reused_read_only"])
+        self.assertTrue(plan["safety"]["writes_limited_to_new_session_overlay"])
+
+    def test_existing_preview_execute_does_not_require_build_network_acknowledgement(self):
+        build_id = "existing-execute-" + uuid.uuid4().hex[:10]
+        with mock.patch.object(self.tool, "run_existing_preview", return_value={"status": "passed"}) as runner:
+            status, output = self.invoke(
+                ["--run-existing", "--build-id", build_id, "--session-id", "resume-01", "--execute"]
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output)["status"], "passed")
+        runner.assert_called_once()
+
+    def test_existing_preview_rejects_unneeded_build_network_acknowledgement(self):
+        status, output = self.invoke(
+            ["--run-existing", "--build-id", "existing-network", "--execute", "--allow-build-network"]
+        )
+
+        self.assertEqual(status, 4)
+        self.assertIn("never uses build networking", output)
+
     def test_qemu_gui_command_keeps_the_guest_offline_and_uses_only_virtual_devices(self):
         paths = self.tool.preview_paths("desktop-command")
         command = self.tool.qemu_command(paths, "/usr/bin/qemu-system-x86_64", "tcg")
@@ -119,6 +160,29 @@ class DesktopPreviewTests(unittest.TestCase):
         self.assertIn("aureon-phase0-shutdown.service", phase_zero)
         self.assertNotIn("aureon-phase0-shutdown.service", desktop)
         self.assertIn("startplasma-wayland", (REPOSITORY_ROOT / "system" / "desktop" / "overlays" / "etc" / "greetd" / "config.toml").read_text(encoding="utf-8"))
+
+    def test_transient_drvfs_serial_read_error_does_not_abort_the_vm(self):
+        """QEMU keeps running when WSL briefly reports ENODATA on its log."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self.tool.preview_paths("drvfs-read", root)
+            paths.work_root.mkdir(parents=True)
+            paths.serial_log.write_text("", encoding="utf-8")
+
+            process = mock.Mock()
+            process.poll.side_effect = [None, 0]
+            process.wait.return_value = 0
+
+            with mock.patch.object(self.tool.subprocess, "Popen", return_value=process), mock.patch.object(
+                Path, "read_text", side_effect=OSError(errno.ENODATA, "No data available")
+            ), mock.patch.object(self.tool.time, "sleep"):
+                result = self.tool._run_interactive_qemu(
+                    ("qemu",), paths, {}, 60, None
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertIsNone(result["desktop_ready_after_seconds"])
 
 
 if __name__ == "__main__":

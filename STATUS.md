@@ -4,6 +4,13 @@
 
 **Fase 0 — primera OCI, `qcow2` y smoke de VM completados con éxito; el runner acotado y sus pruebas unitarias están implementados, pero su primera ejecución real y la repetición desde checkout limpio siguen pendientes.**
 
+La base de control de las fases maestras 0–32 también está implementada en
+fuente: autoridad A–D, diagnósticos locales, planes reversibles de recursos,
+política de controladores/datos y puertas de actualización, integridad e
+instalador. Esto no declara concluidas las fases de hardware, firmware,
+instalación o compatibilidad: permanecen bloqueadas hasta ser validadas en un
+equipo real y con la confirmación correspondiente.
+
 ## Hechos confirmados
 
 - El repositorio Git local, la estructura inicial y los ADRs de Fase 0 están creados.
@@ -14,7 +21,13 @@
 - `aureon-dev test-smoke` ya tiene un plan determinista sin escritura y un modo `--execute` deliberadamente estrecho. Este último exige root dentro de Linux/WSL, un `build-id` nuevo, imágenes locales por digest, red deshabilitada, el store dedicado y rutas de artefactos exclusivamente virtuales; aún no se ha ejecutado en vivo desde este runner.
 - La receta bootc se ejecutó una vez de forma manual, explícitamente aprobada y acotada. La OCI derivada quedó fijada en `sha256:a1a941807af32f1f9ce57f37189befc69a930cc60e889b1c00961ea966fc0d76`; el conversor unificado produjo un `qcow2` válido y sin red.
 - El `qcow2` validado está en `images/phase0-f44-20260718/aureon-base.qcow2`; QEMU lo abrió mediante un overlay separado, observó `AUREON_PHASE0_READY` y el guest se apagó limpiamente. La evidencia estructurada está bajo `build/phase0-f44-20260718/` y `work/qemu/phase0-f44-20260718/`.
-- La preview de escritorio KDE está definida por separado en `system/desktop/` y se abre mediante `tools/aureon-desktop-preview`. Es una VM de desarrollo desechable; su primera ejecución en vivo sigue pendiente y no constituye una instalación ni una versión de hardware real.
+- La preview de escritorio KDE está definida por separado en `system/desktop/` y se abre mediante `tools/aureon-desktop-preview`. Las conversiones `preview-08` y `preview-09` llegaron al target gráfico dentro de QEMU; sigue siendo una VM de desarrollo desechable, no una instalación ni una validación de hardware real.
+- Se conservaron conversiones validadas `desktop-preview-08` y
+  `desktop-preview-09`. `tools/aureon-desktop-preview --run-existing` permite
+  abrir una de ellas mediante un overlay nuevo, sin recompilar ni dar red a la
+  VM.
+- `tools/aureonctl` valida contratos fuente y expone los diagnósticos y planes
+  locales de las fases maestras sin efectuar acciones privilegiadas ni envíos.
 - No se ha usado ningún disco físico, `PhysicalDrive`, partición, bootloader ni firmware del host como destino de Aureon.
 
 ## Auditoría del entorno (18 de julio de 2026)

@@ -14,6 +14,7 @@ La configuración de un proveedor concreto queda pendiente de seleccionar el rem
 Mientras se selecciona proveedor, el contrato local reutilizable es:
 
 ```bash
+python3 tools/aureonctl validate
 python3 -m unittest discover -s tests/unit -p 'test_*.py'
 python3 tools/aureon-dev test-smoke --build-id ci-review --dry-run
 ```

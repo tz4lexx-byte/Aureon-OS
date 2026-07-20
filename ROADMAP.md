@@ -1,5 +1,22 @@
 # Roadmap
 
+## Plan maestro de fases 0–32
+
+El plan maestro ampliado está materializado como contratos, diagnósticos y
+gates en [docs/aureon-phase-map.md](docs/aureon-phase-map.md). Las fases que
+necesitan hardware físico, firmware, instalación, controladores propietarios o
+consentimiento por juego no se marcan como completas por una preview QEMU: se
+declaran explícitamente como `hardware-validation-required`,
+`manual-confirmation-required` o `release-gated`.
+
+La primera entrega de esta capa se valida con:
+
+```bash
+python3 tools/aureonctl validate
+python3 tools/aureonctl status
+python3 -m unittest discover -s tests/unit -p 'test_*.py'
+```
+
 ## Fase 0 — Investigación y cimientos
 
 - [x] Crear repositorio local aislado.

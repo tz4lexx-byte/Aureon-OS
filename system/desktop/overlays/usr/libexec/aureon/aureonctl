@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""Read-only Aureon control plane for the desktop preview and future images.
+
+Every subcommand either reports local state or renders a plan.  This program
+does not install packages, change a cgroup, start a game, access a camera or
+microphone, download updates, export diagnostics, change firmware, partition
+disks, or invoke a shell.  Those operations remain explicit future actions
+with the authority level recorded in the project policy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import datetime as dt
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, TextIO
+
+
+PROGRAM = "aureonctl"
+SCHEMA = "aureon.control-plane-report"
+VERSION = 1
+SAFE_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._:+-]{0,95}")
+
+
+# Keep this compact runtime catalogue in the image.  The fuller, reviewable
+# source-of-truth is packaging/aureon-control-plane.json in the repository.
+ACTIONS: dict[str, dict[str, Any]] = {
+    "baseline.collect": {
+        "authority": "A",
+        "reversible": True,
+        "network": False,
+        "impact": "Solo lee metricas locales; la salida no se guarda sin redireccion del usuario.",
+    },
+    "resource.defer-maintenance": {
+        "authority": "A",
+        "reversible": True,
+        "network": False,
+        "impact": "Plan temporal para trabajo diferible; no cierra aplicaciones.",
+    },
+    "resource.protect-interactive": {
+        "authority": "A",
+        "reversible": True,
+        "network": False,
+        "impact": "Plan de pesos cgroup temporales, nunca prioridad maxima permanente.",
+    },
+    "driver.rollback-boot-failure": {
+        "authority": "B",
+        "reversible": True,
+        "network": False,
+        "impact": "Futuro rollback local solo despues de un fallo de arranque demostrado.",
+    },
+    "driver.install-proprietary": {
+        "authority": "C",
+        "reversible": True,
+        "network": True,
+        "impact": "Requiere confirmacion, manifiesto firmado y posiblemente reinicio.",
+    },
+    "integrity.enable-competitive": {
+        "authority": "C",
+        "reversible": True,
+        "network": "only-after-per-game-consent",
+        "impact": "No esta implementado; requerira activacion por juego.",
+    },
+    "firmware.update": {
+        "authority": "C",
+        "reversible": False,
+        "network": True,
+        "impact": "Nunca se inicia automaticamente; puede requerir corriente y reinicio.",
+    },
+    "installer.partition-or-format": {
+        "authority": "D",
+        "reversible": False,
+        "network": False,
+        "impact": "Solo manual; puede destruir datos o modificar el arranque.",
+    },
+    "diagnostics.export": {
+        "authority": "D",
+        "reversible": False,
+        "network": True,
+        "impact": "Solo manual despues de seleccionar y revisar los datos.",
+    },
+}
+
+
+PHASE_STATES = {
+    0: "implemented-foundation",
+    1: "implemented-foundation",
+    2: "implemented-foundation",
+    3: "implemented",
+    4: "implemented-foundation",
+    5: "implemented-foundation",
+    6: "implemented-foundation",
+    7: "implemented-foundation",
+    8: "implemented-foundation",
+    9: "implemented-foundation",
+    10: "implemented-foundation",
+    11: "implemented-foundation",
+    12: "implemented-foundation",
+    13: "hardware-validation-required",
+    14: "hardware-validation-required",
+    15: "hardware-validation-required",
+    16: "implemented-foundation",
+    17: "implemented-foundation",
+    18: "implemented-foundation",
+    19: "implemented-foundation",
+    20: "implemented-foundation",
+    21: "implemented-foundation",
+    22: "implemented-foundation",
+    23: "design-only",
+    24: "blocked-by-necessity-review",
+    25: "implemented-foundation",
+    26: "implemented-foundation",
+    27: "manual-confirmation-required",
+    28: "manual-confirmation-required",
+    29: "implemented-foundation",
+    30: "hardware-validation-required",
+    31: "implemented-foundation",
+    32: "release-gated",
+}
+
+
+def _now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _emit(payload: dict[str, Any], output: TextIO) -> None:
+    payload.setdefault("schema", SCHEMA)
+    payload.setdefault("version", VERSION)
+    payload.setdefault("generated_at_utc", _now())
+    json.dump(payload, output, ensure_ascii=False, indent=2, sort_keys=True)
+    output.write("\n")
+
+
+def _repo_root() -> Path | None:
+    """Find the checkout only when this executable runs from it."""
+
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / "packaging" / "aureon-control-plane.json").is_file():
+            return candidate
+    return None
+
+
+def _safe_read(path: Path, limit: int = 131_072) -> str | None:
+    try:
+        if not path.is_file() or path.is_symlink():
+            return None
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            return handle.read(limit)
+    except OSError:
+        return None
+
+
+def _safe_command(argv: tuple[str, ...], timeout: int = 8) -> dict[str, Any]:
+    """Capture a fixed local inspection command without a shell or network."""
+
+    executable = shutil.which(argv[0])
+    if not executable:
+        return {"state": "unavailable", "command": argv[0]}
+    try:
+        result = subprocess.run(
+            (executable,) + argv[1:],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"state": "unavailable", "command": argv[0], "detail": str(error)}
+    return {
+        "state": "available" if result.returncode == 0 else "failed",
+        "command": argv[0],
+        "returncode": result.returncode,
+        "stdout": result.stdout[:65_536],
+    }
+
+
+def _tool_state(name: str) -> str:
+    return "installed" if shutil.which(name) else "missing"
+
+
+def _cgroup_mode() -> str:
+    try:
+        return "v2" if Path("/sys/fs/cgroup/cgroup.controllers").exists() else "other"
+    except OSError:
+        return "unavailable"
+
+
+def _secure_boot_state() -> str:
+    candidates = tuple(Path("/sys/firmware/efi/efivars").glob("SecureBoot-*"))
+    if not candidates:
+        return "unavailable"
+    try:
+        value = candidates[0].read_bytes()
+        return "enabled" if value and value[-1] == 1 else "disabled"
+    except OSError:
+        return "unavailable"
+
+
+def _selinux_state() -> str:
+    result = _safe_command(("getenforce",))
+    if result["state"] != "available":
+        return "unavailable"
+    return str(result["stdout"]).strip().lower() or "unavailable"
+
+
+def _validate_label(value: str, label: str) -> str:
+    if not SAFE_LABEL.fullmatch(value):
+        raise ValueError("{0} must be a 1-96 character label, not a path or command".format(label))
+    return value
+
+
+def _hardware_report() -> dict[str, Any]:
+    """Collect a bounded local hardware report without persisting or sending it."""
+
+    drm_nodes = []
+    try:
+        drm_nodes = sorted(entry.name for entry in Path("/sys/class/drm").iterdir())
+    except OSError:
+        pass
+    input_nodes = []
+    try:
+        input_nodes = sorted(entry.name for entry in Path("/dev/input").iterdir())
+    except OSError:
+        pass
+    network_nodes = []
+    try:
+        network_nodes = sorted(entry.name for entry in Path("/sys/class/net").iterdir())
+    except OSError:
+        pass
+    return {
+        "privacy": "local-only; this report is not written or transmitted",
+        "kernel": platform.release(),
+        "architecture": platform.machine(),
+        "cgroup_mode": _cgroup_mode(),
+        "drm_nodes": drm_nodes,
+        "input_nodes": input_nodes,
+        "network_interfaces": network_nodes,
+        "pci": _safe_command(("lspci", "-nn")),
+        "usb": _safe_command(("lsusb",)),
+        "cpu": _safe_command(("lscpu", "--json")),
+        "kernel_modules": _safe_command(("lsmod",)),
+        "audio": {
+            "pipewire": _tool_state("pipewire"),
+            "wireplumber": _tool_state("wireplumber"),
+            "wpctl": _tool_state("wpctl"),
+        },
+        "graphics": {
+            "vulkaninfo": _tool_state("vulkaninfo"),
+            "glxinfo": _tool_state("glxinfo"),
+            "render_nodes_present": Path("/dev/dri").is_dir(),
+        },
+    }
+
+
+def _baseline_report() -> dict[str, Any]:
+    script = Path(__file__).with_name("aureon-baseline")
+    if not script.is_file():
+        return {"state": "unavailable", "reason": "aureon-baseline is not installed"}
+    result = _safe_command(("bash", str(script)), timeout=30)
+    if result["state"] != "available":
+        return {"state": "failed", "runner": result}
+    metrics: dict[str, str] = {}
+    for line in str(result["stdout"]).splitlines():
+        if "=" in line and not line.startswith((" ", "\t")):
+            key, value = line.split("=", 1)
+            metrics[key] = value
+    return {"state": "available", "metrics": metrics, "raw_sections_omitted": True}
+
+
+def _validate_toml(path: Path) -> str | None:
+    """Parse TOML with the stdlib when available, with a strict small fallback."""
+
+    source = _safe_read(path)
+    if source is None:
+        return "missing or unsafe TOML file"
+    try:
+        import tomllib  # Python 3.11+
+
+        tomllib.loads(source)
+        return None
+    except ImportError:
+        section = re.compile(r"^\[[A-Za-z0-9_.-]+\]$")
+        assignment = re.compile(r"^[A-Za-z0-9_.-]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|true|false|[0-9]+)$")
+        for number, line in enumerate(source.splitlines(), 1):
+            stripped = line.split("#", 1)[0].strip()
+            if stripped and not section.fullmatch(stripped) and not assignment.fullmatch(stripped):
+                return "unsupported or invalid TOML at line {0}".format(number)
+        return None
+    except Exception as error:
+        return str(error)
+
+
+def _validate_ini(path: Path) -> str | None:
+    source = _safe_read(path)
+    if source is None:
+        return "missing or unsafe INI file"
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str
+    try:
+        parser.read_string(source)
+    except configparser.Error as error:
+        return str(error)
+    return None
+
+
+def _validate_layout_javascript(path: Path) -> str | None:
+    """Perform a deliberately small structural check without executing JS."""
+
+    source = _safe_read(path)
+    if source is None:
+        return "missing or unsafe JavaScript file"
+    forbidden = ("fetch(", "xmlhttprequest", "require(", "import ", "child_process")
+    lowered = source.lower()
+    if any(token in lowered for token in forbidden):
+        return "layout must not load network or external code"
+    stack: list[str] = []
+    matching = {")": "(", "]": "[", "}": "{"}
+    quote: str | None = None
+    escaped = False
+    for character in source:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character in "([{":
+            stack.append(character)
+        elif character in ")]}":
+            if not stack or stack.pop() != matching[character]:
+                return "unbalanced JavaScript delimiters"
+    if quote is not None or stack:
+        return "unterminated JavaScript string or delimiter"
+    return None
+
+
+def _validate_desktop_overlay(root: Path) -> tuple[list[str], list[str]]:
+    """Validate the reviewable desktop overlay formats without executing them."""
+
+    overlay = root / "system" / "desktop" / "overlays"
+    checks: list[str] = []
+    errors: list[str] = []
+    toml = overlay / "etc" / "greetd" / "config.toml"
+    result = _validate_toml(toml)
+    checks.append(toml.relative_to(root).as_posix())
+    if result:
+        errors.append("{0}: {1}".format(toml.relative_to(root).as_posix(), result))
+    for relative in (
+        "etc/skel/.config/kdeglobals",
+        "etc/skel/.config/kscreenlockerrc",
+        "etc/skel/.config/kwinrc",
+        "etc/skel/.config/kxkbrc",
+    ):
+        candidate = overlay / relative
+        result = _validate_ini(candidate)
+        checks.append(candidate.relative_to(root).as_posix())
+        if result:
+            errors.append("{0}: {1}".format(candidate.relative_to(root).as_posix(), result))
+    layout = overlay / "usr" / "share" / "plasma" / "look-and-feel" / "org.aureon.desktop" / "contents" / "layouts" / "org.kde.plasma.desktop-layout.js"
+    result = _validate_layout_javascript(layout)
+    checks.append(layout.relative_to(root).as_posix())
+    if result:
+        errors.append("{0}: {1}".format(layout.relative_to(root).as_posix(), result))
+    try:
+        sources = tuple(overlay.rglob("*"))
+    except OSError as error:
+        errors.append("desktop overlay cannot be enumerated: {0}".format(error))
+    else:
+        for candidate in sources:
+            if candidate.is_symlink():
+                errors.append("desktop overlay must not contain a source symlink: {0}".format(candidate.relative_to(root).as_posix()))
+    return checks, errors
+
+
+def _validate_sources() -> dict[str, Any]:
+    root = _repo_root()
+    if root is None:
+        return {
+            "state": "partial",
+            "reason": "runtime image has no checkout; local source validation is unavailable",
+            "checks": {"runtime": "present"},
+        }
+    relative_json = (
+        "packaging/aureon-control-plane.json",
+        "packaging/desktop-profile.json",
+        "packaging/service-classes.json",
+        "packaging/data-classes.json",
+        "packaging/driver-policy.json",
+        "packaging/game-profile.schema.json",
+    )
+    errors: list[str] = []
+    for relative in relative_json:
+        path = root / relative
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(parsed, dict):
+                errors.append(relative + " must contain a JSON object")
+        except (OSError, json.JSONDecodeError) as error:
+            errors.append("{0}: {1}".format(relative, error))
+    required_docs = (
+        "docs/aureon-user-authority.md",
+        "docs/policies/privacy.md",
+        "docs/policies/data.md",
+        "docs/policies/updates.md",
+        "docs/policies/drivers.md",
+        "docs/reproducibility.md",
+        "docs/testing/baseline.md",
+        "docs/aureon-phase-map.md",
+    )
+    for relative in required_docs:
+        if not (root / relative).is_file():
+            errors.append(relative + " is required by the phase-control contract")
+    desktop = root / "system" / "desktop" / "Containerfile"
+    if "FROM quay.io/fedora/fedora-bootc@sha256:" not in (desktop.read_text(encoding="utf-8") if desktop.is_file() else ""):
+        errors.append("system/desktop/Containerfile must pin the Fedora bootc base by digest")
+    greetd = root / "system" / "desktop" / "overlays" / "etc" / "greetd" / "config.toml"
+    if "startplasma-wayland" not in (_safe_read(greetd) or ""):
+        errors.append("greetd must start the reviewed Wayland Plasma session")
+    overlay_checks, overlay_errors = _validate_desktop_overlay(root)
+    errors.extend(overlay_errors)
+    return {
+        "state": "passed" if not errors else "failed",
+        "errors": errors,
+        "checked_files": list(relative_json) + list(required_docs) + overlay_checks,
+    }
+
+
+def _resource_plan(mode: str) -> dict[str, Any]:
+    if mode not in {"stable", "gaming", "streaming", "competitive", "development"}:
+        raise ValueError("unknown mode")
+    session_classes = {
+        "critical": ["input", "audio", "compositor"],
+        "interactive": ["foreground-application"],
+        "normal": ["background-application"],
+        "deferrable": ["indexing", "update-download", "cache-cleanup", "backup"],
+    }
+    plan: dict[str, Any] = {
+        "state": "plan-only",
+        "mode": mode,
+        "cgroup_mode_detected": _cgroup_mode(),
+        "process_classes": session_classes,
+        "forbidden_actions": [
+            "kill interactive applications",
+            "set permanent maximum priority",
+            "change voltages or overclock hardware",
+        ],
+        "restoration": "all temporary preferences expire when the selected session ends",
+    }
+    if mode in {"gaming", "streaming"}:
+        plan["temporary_actions"] = [
+            "defer deferrable work",
+            "protect audio and compositor responsiveness",
+            "reserve I/O planning for the foreground workload",
+        ]
+    elif mode == "competitive":
+        plan["blocked"] = "competitive integrity requires per-game user confirmation and is not implemented"
+    else:
+        plan["temporary_actions"] = ["no policy is applied"]
+    return plan
+
+
+def _driver_report() -> dict[str, Any]:
+    modules = _safe_read(Path("/proc/modules")) or ""
+    return {
+        "state": "inspection-only",
+        "kernel": platform.release(),
+        "graphics_stack": {
+            "dri_nodes": sorted(item.name for item in Path("/dev/dri").iterdir()) if Path("/dev/dri").is_dir() else [],
+            "vulkaninfo": _tool_state("vulkaninfo"),
+            "mesa_query": _tool_state("glxinfo"),
+        },
+        "ntsync": {
+            "device": "present" if Path("/dev/ntsync").exists() else "absent",
+            "module": "loaded" if re.search(r"^ntsync\s", modules, flags=re.MULTILINE) else "not-loaded",
+        },
+        "secure_boot": _secure_boot_state(),
+        "selinux": _selinux_state(),
+        "policy": {
+            "automatic_install": "forbidden",
+            "automatic_choice": "only installed, signed, unequivocal matches in a future implementation",
+            "user_confirmation": ["proprietary driver", "channel change", "downgrade", "restart"],
+        },
+    }
+
+
+def _integrity_report() -> dict[str, Any]:
+    os_release = _safe_read(Path("/usr/lib/os-release")) or _safe_read(Path("/etc/os-release")) or ""
+    is_aureon = any(line.startswith("ID=aureon") for line in os_release.splitlines())
+    return {
+        "state": "local-basic-diagnostics",
+        "data_sent": False,
+        "system_identity": "aureon" if is_aureon else "non-aureon-or-development-environment",
+        "secure_boot": _secure_boot_state(),
+        "selinux": _selinux_state(),
+        "ntsync_device": "present" if Path("/dev/ntsync").exists() else "absent",
+        "competitive_integrity": "not-implemented",
+        "not_observed": [
+            "documents", "conversations", "keystrokes", "screenshots", "microphone", "camera", "general process list"
+        ],
+    }
+
+
+def _plan_report(kind: str) -> dict[str, Any]:
+    plans = {
+        "update": {
+            "state": "plan-only",
+            "workflow": ["check", "download", "validate", "create deployment", "user chooses restart", "confirm or rollback"],
+            "network": "disabled by this command",
+            "confirmation_required": ["restart", "driver channel change", "firmware update"],
+            "forbidden": ["partial in-place mutation", "forced restart"],
+        },
+        "recovery": {
+            "state": "plan-only",
+            "workflow": ["preserve evidence", "select known-good deployment", "boot isolated recovery", "user reviews result"],
+            "forbidden": ["delete user data", "alter host boot configuration"],
+        },
+        "installer": {
+            "state": "manual-only",
+            "target": "none",
+            "required_before_any_write": [
+                "visual disk selection", "simulation", "explicit partition confirmation", "backup review", "bootloader choice"
+            ],
+            "forbidden": ["automatic partitioning", "automatic formatting", "changing Windows boot order"],
+        },
+    }
+    return plans[kind]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=PROGRAM,
+        description="Aureon local control-plane inspector. All commands are read-only or plan-only.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    status = commands.add_parser("status", help="show phase implementation states")
+    status.add_argument("--phase", type=int, choices=range(33))
+
+    authority = commands.add_parser("authority", help="show authority contract for an action")
+    authority.add_argument("action", nargs="?", choices=sorted(ACTIONS))
+
+    commands.add_parser("validate", help="validate local source contracts without writing")
+    commands.add_parser("baseline", help="collect a local baseline without storing or exporting it")
+
+    hardware = commands.add_parser("hardware", help="local hardware diagnostics")
+    hardware_sub = hardware.add_subparsers(dest="hardware_command", required=True)
+    hardware_sub.add_parser("doctor", help="inspect local hardware and capabilities")
+
+    driver = commands.add_parser("driver", help="local driver diagnostics")
+    driver_sub = driver.add_subparsers(dest="driver_command", required=True)
+    driver_sub.add_parser("doctor", help="inspect graphics, kernel and security capabilities")
+
+    resource = commands.add_parser("resource", help="render a no-write resource policy plan")
+    resource_sub = resource.add_subparsers(dest="resource_command", required=True)
+    resource_plan = resource_sub.add_parser("plan", help="show a temporary cgroup-v2 policy plan")
+    resource_plan.add_argument("--mode", default="stable", choices=("stable", "gaming", "streaming", "competitive", "development"))
+
+    gaming = commands.add_parser("gaming", help="render a no-write game session plan")
+    gaming_sub = gaming.add_subparsers(dest="gaming_command", required=True)
+    gaming_plan = gaming_sub.add_parser("plan", help="show the reversible game-session policy")
+    gaming_plan.add_argument("--game", default="selected-game")
+
+    streaming = commands.add_parser("streaming", help="render a no-write streaming session plan")
+    streaming_sub = streaming.add_subparsers(dest="streaming_command", required=True)
+    streaming_plan = streaming_sub.add_parser("plan", help="show the reversible streaming policy")
+    streaming_plan.add_argument("--encoder", choices=("auto", "vaapi", "nvenc", "x264"), default="auto")
+
+    integrity = commands.add_parser("integrity", help="local integrity diagnostics")
+    integrity_sub = integrity.add_subparsers(dest="integrity_command", required=True)
+    integrity_sub.add_parser("doctor", help="inspect only local basic integrity state")
+
+    for name in ("update", "recovery", "installer"):
+        command = commands.add_parser(name, help="render a safe {0} plan".format(name))
+        sub = command.add_subparsers(dest=name + "_command", required=True)
+        sub.add_parser("plan", help="show the no-write {0} workflow".format(name))
+    return parser
+
+
+def main(arguments: list[str] | None = None, output: TextIO | None = None) -> int:
+    output = output or sys.stdout
+    args = build_parser().parse_args(arguments)
+    try:
+        if args.command == "status":
+            phases = {str(args.phase): PHASE_STATES[args.phase]} if args.phase is not None else {str(key): value for key, value in PHASE_STATES.items()}
+            _emit({"command": "status", "phases": phases, "all_actions_are_plan_or_diagnostic_only": True}, output)
+        elif args.command == "authority":
+            action = {args.action: ACTIONS[args.action]} if args.action else ACTIONS
+            _emit({"command": "authority", "actions": action}, output)
+        elif args.command == "validate":
+            _emit({"command": "validate", "result": _validate_sources()}, output)
+        elif args.command == "baseline":
+            _emit({"command": "baseline", "result": _baseline_report(), "data_sent": False}, output)
+        elif args.command == "hardware":
+            _emit({"command": "hardware doctor", "result": _hardware_report()}, output)
+        elif args.command == "driver":
+            _emit({"command": "driver doctor", "result": _driver_report()}, output)
+        elif args.command == "resource":
+            _emit({"command": "resource plan", "result": _resource_plan(args.mode)}, output)
+        elif args.command == "gaming":
+            game = _validate_label(args.game, "--game")
+            _emit({
+                "command": "gaming plan",
+                "result": {
+                    "state": "plan-only", "game_label": game, "mode": "gaming",
+                    "actions": _resource_plan("gaming")["temporary_actions"],
+                    "does_not": ["launch a game", "install Proton", "change drivers", "enable overclocking"],
+                    "restore_after_session": True,
+                },
+            }, output)
+        elif args.command == "streaming":
+            _emit({
+                "command": "streaming plan",
+                "result": {
+                    "state": "plan-only", "mode": "streaming", "encoder_preference": args.encoder,
+                    "actions": _resource_plan("streaming")["temporary_actions"],
+                    "confirmation_required": ["start broadcast", "select platform/key", "activate camera", "activate microphone"],
+                    "does_not": ["open OBS", "record", "stream", "access camera", "access microphone"],
+                },
+            }, output)
+        elif args.command == "integrity":
+            _emit({"command": "integrity doctor", "result": _integrity_report()}, output)
+        elif args.command in {"update", "recovery", "installer"}:
+            _emit({"command": args.command + " plan", "result": _plan_report(args.command)}, output)
+        else:
+            raise ValueError("unknown command")
+    except ValueError as error:
+        print("{0}: {1}".format(PROGRAM, error), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
