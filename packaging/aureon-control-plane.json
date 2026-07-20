@@ -31,6 +31,14 @@
     }
   },
   "actions": {
+    "desktop.apply-appearance": {
+      "authority": "A",
+      "data": ["preferencia visual local", "preferencias de accesibilidad"],
+      "impact": "Cambia tema, color, transparencia o wallpaper solo en la sesión local.",
+      "reversible": true,
+      "network": false,
+      "implementation": "aureonctl appearance plan; defaults de Plasma"
+    },
     "baseline.collect": {
       "authority": "A",
       "data": ["metricas locales del sistema", "estado de servicios", "presion de recursos"],

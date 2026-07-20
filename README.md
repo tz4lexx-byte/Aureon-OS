@@ -51,6 +51,8 @@ Consulta el [mapa de fases](docs/aureon-phase-map.md) y el
 hardware, firmware, particiones o consentimiento por juego permanecen
 explícitamente bloqueadas hasta tener evidencia y aprobación del usuario.
 
+La preview también incorpora el perfil visual [Aureon Liquid Glass](docs/design/aureon-liquid-glass.md): paleta azul-violeta, panel flotante y assets SVG locales. Se integra en la siguiente imagen que construyas; tu `preview-09` actual puede seguir abriéndose sin reconstruirla.
+
 ## Primeros comandos seguros
 
 El CLI de bootstrap ya está disponible. `doctor` solo inspecciona y puede devolver un código distinto de cero cuando el entorno aún no está listo; eso es el resultado esperado antes de instalar las dependencias. Estos comandos no instalan software ni modifican discos:

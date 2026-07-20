@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -33,6 +34,12 @@ SAFE_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._:+-]{0,95}")
 # Keep this compact runtime catalogue in the image.  The fuller, reviewable
 # source-of-truth is packaging/aureon-control-plane.json in the repository.
 ACTIONS: dict[str, dict[str, Any]] = {
+    "desktop.apply-appearance": {
+        "authority": "A",
+        "reversible": True,
+        "network": False,
+        "impact": "Plan local y reversible de tema, transparencia y wallpaper.",
+    },
     "baseline.collect": {
         "authority": "A",
         "reversible": True,
@@ -86,6 +93,30 @@ ACTIONS: dict[str, dict[str, Any]] = {
         "reversible": False,
         "network": True,
         "impact": "Solo manual despues de seleccionar y revisar los datos.",
+    },
+}
+
+
+APPEARANCE_PROFILES: dict[str, dict[str, str]] = {
+    "off": {
+        "blur": "disabled",
+        "transparency": "disabled",
+        "note": "Prioriza legibilidad y el coste visual mínimo.",
+    },
+    "lite": {
+        "blur": "low",
+        "transparency": "low",
+        "note": "Vidrio discreto en superficies flotantes.",
+    },
+    "balanced": {
+        "blur": "moderate",
+        "transparency": "moderate",
+        "note": "Predeterminado Liquid Glass; contraste y legibilidad protegidos.",
+    },
+    "ultra": {
+        "blur": "high",
+        "transparency": "high",
+        "note": "No se activa automáticamente; requiere comprobar la fluidez en el hardware real.",
     },
 }
 
@@ -349,6 +380,28 @@ def _validate_layout_javascript(path: Path) -> str | None:
     return None
 
 
+def _validate_svg(path: Path) -> str | None:
+    """Check a local vector asset without loading it or resolving references."""
+
+    source = _safe_read(path)
+    if source is None:
+        return "missing or unsafe SVG file"
+    try:
+        root = ET.fromstring(source)
+    except ET.ParseError as error:
+        return str(error)
+    if root.tag.rsplit("}", 1)[-1] != "svg":
+        return "root element must be svg"
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] in {"image", "script", "foreignObject"}:
+            return "SVG must not embed raster, script, or foreign content"
+        for value in element.attrib.values():
+            normalized = value.strip().lower()
+            if "http://" in normalized or "https://" in normalized or "file://" in normalized:
+                return "SVG must not reference an external resource"
+    return None
+
+
 def _validate_desktop_overlay(root: Path) -> tuple[list[str], list[str]]:
     """Validate the reviewable desktop overlay formats without executing them."""
 
@@ -365,6 +418,9 @@ def _validate_desktop_overlay(root: Path) -> tuple[list[str], list[str]]:
         "etc/skel/.config/kscreenlockerrc",
         "etc/skel/.config/kwinrc",
         "etc/skel/.config/kxkbrc",
+        "etc/skel/.config/plasmarc",
+        "etc/xdg/autostart/aureon-apply-appearance.desktop",
+        "usr/share/color-schemes/AureonLiquidGlass.colors",
     ):
         candidate = overlay / relative
         result = _validate_ini(candidate)
@@ -376,6 +432,15 @@ def _validate_desktop_overlay(root: Path) -> tuple[list[str], list[str]]:
     checks.append(layout.relative_to(root).as_posix())
     if result:
         errors.append("{0}: {1}".format(layout.relative_to(root).as_posix(), result))
+    for relative in (
+        "usr/share/plasma/desktoptheme/AureonLiquidGlass/widgets/panel-background.svg",
+        "usr/share/wallpapers/AureonLiquidGlass/contents/images/1920x1080.svg",
+    ):
+        candidate = overlay / relative
+        result = _validate_svg(candidate)
+        checks.append(candidate.relative_to(root).as_posix())
+        if result:
+            errors.append("{0}: {1}".format(candidate.relative_to(root).as_posix(), result))
     try:
         sources = tuple(overlay.rglob("*"))
     except OSError as error:
@@ -402,6 +467,9 @@ def _validate_sources() -> dict[str, Any]:
         "packaging/data-classes.json",
         "packaging/driver-policy.json",
         "packaging/game-profile.schema.json",
+        "packaging/appearance-profiles.json",
+        "system/desktop/overlays/usr/share/plasma/desktoptheme/AureonLiquidGlass/metadata.json",
+        "system/desktop/overlays/usr/share/wallpapers/AureonLiquidGlass/metadata.json",
     )
     errors: list[str] = []
     for relative in relative_json:
@@ -472,6 +540,30 @@ def _resource_plan(mode: str) -> dict[str, Any]:
     else:
         plan["temporary_actions"] = ["no policy is applied"]
     return plan
+
+
+def _appearance_plan(profile: str) -> dict[str, Any]:
+    """Describe a local visual profile without changing the current session."""
+
+    if profile not in APPEARANCE_PROFILES:
+        raise ValueError("unknown appearance profile")
+    selected = APPEARANCE_PROFILES[profile]
+    return {
+        "state": "plan-only",
+        "profile": profile,
+        "theme": "AureonLiquidGlass" if profile != "off" else "system-accessibility-theme",
+        "color_scheme": "AureonLiquidGlass" if profile != "off" else "system-accessibility-color-scheme",
+        "wallpaper": "AureonLiquidGlass" if profile != "off" else "user-choice",
+        "blur": selected["blur"],
+        "transparency": selected["transparency"],
+        "accessibility": [
+            "high contrast remains a user choice",
+            "reduce motion remains a user choice",
+            "reduce transparency remains a user choice",
+        ],
+        "does_not": ["download assets", "change host settings", "override a user choice after initial setup"],
+        "note": selected["note"],
+    }
 
 
 def _driver_report() -> dict[str, Any]:
@@ -570,6 +662,11 @@ def build_parser() -> argparse.ArgumentParser:
     resource_plan = resource_sub.add_parser("plan", help="show a temporary cgroup-v2 policy plan")
     resource_plan.add_argument("--mode", default="stable", choices=("stable", "gaming", "streaming", "competitive", "development"))
 
+    appearance = commands.add_parser("appearance", help="render a no-write Liquid Glass appearance plan")
+    appearance_sub = appearance.add_subparsers(dest="appearance_command", required=True)
+    appearance_plan = appearance_sub.add_parser("plan", help="show a local, reversible appearance profile")
+    appearance_plan.add_argument("--profile", default="balanced", choices=tuple(APPEARANCE_PROFILES))
+
     gaming = commands.add_parser("gaming", help="render a no-write game session plan")
     gaming_sub = gaming.add_subparsers(dest="gaming_command", required=True)
     gaming_plan = gaming_sub.add_parser("plan", help="show the reversible game-session policy")
@@ -611,6 +708,8 @@ def main(arguments: list[str] | None = None, output: TextIO | None = None) -> in
             _emit({"command": "driver doctor", "result": _driver_report()}, output)
         elif args.command == "resource":
             _emit({"command": "resource plan", "result": _resource_plan(args.mode)}, output)
+        elif args.command == "appearance":
+            _emit({"command": "appearance plan", "result": _appearance_plan(args.profile)}, output)
         elif args.command == "gaming":
             game = _validate_label(args.game, "--game")
             _emit({

@@ -5,12 +5,12 @@
         "Name": "Aureon OS Project"
       }
     ],
-    "Description": "Aureon OS Liquid Glass Plasma desktop",
+    "Description": "Translucent blue-violet surfaces for the Aureon Liquid Glass profile",
     "EnabledByDefault": true,
-    "Id": "org.aureon.desktop",
+    "Id": "AureonLiquidGlass",
     "License": "GPL-3.0-or-later",
     "Name": "Aureon Liquid Glass",
     "Version": "0.2.0"
   },
-  "X-Plasma-APIVersion": "2"
+  "X-Plasma-API": "5.0"
 }

@@ -3,7 +3,15 @@ LookAndFeelPackage=org.aureon.desktop
 widgetStyle=Breeze
 
 [General]
-ColorScheme=BreezeDark
+ColorScheme=AureonLiquidGlass
 
 [Icons]
 Theme=breeze
+
+[WM]
+activeBackground=33,48,83
+activeBlend=103,211,255
+activeForeground=248,251,255
+inactiveBackground=21,31,54
+inactiveBlend=88,101,147
+inactiveForeground=176,191,220

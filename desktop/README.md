@@ -20,3 +20,8 @@ La siguiente reconstrucción de la imagen incluirá `aureonctl` y los accesos
 Todos empiezan como diagnósticos o planes locales; no instalan controladores,
 no aplican límites de recursos, no transmiten datos ni realizan cambios de
 disco.
+
+El siguiente build de escritorio incorpora **Aureon Liquid Glass**: esquema
+azul-violeta, panel flotante translúcido, tema Plasma vectorial y wallpaper SVG
+local. Una preview ya creada no se altera; conserva su imagen base y puede
+abrirse con `--run-existing`.

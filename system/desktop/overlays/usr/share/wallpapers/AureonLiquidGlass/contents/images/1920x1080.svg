@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <linearGradient id="night" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#070d1f"/>
+      <stop offset="0.46" stop-color="#142851"/>
+      <stop offset="1" stop-color="#15133d"/>
+    </linearGradient>
+    <radialGradient id="cyan" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#7ce9ff" stop-opacity="0.86"/>
+      <stop offset="0.42" stop-color="#49a8ff" stop-opacity="0.46"/>
+      <stop offset="1" stop-color="#49a8ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="violet" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#bd9dff" stop-opacity="0.72"/>
+      <stop offset="0.46" stop-color="#7a66ef" stop-opacity="0.37"/>
+      <stop offset="1" stop-color="#7a66ef" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="0.42" stop-color="#d9f8ff" stop-opacity="0.07"/>
+      <stop offset="1" stop-color="#a897ff" stop-opacity="0.13"/>
+    </linearGradient>
+    <linearGradient id="stroke" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.50"/>
+      <stop offset="1" stop-color="#79d8ff" stop-opacity="0.08"/>
+    </linearGradient>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="42"/>
+    </filter>
+  </defs>
+  <rect width="1920" height="1080" fill="url(#night)"/>
+  <ellipse cx="365" cy="225" rx="460" ry="350" fill="url(#cyan)" filter="url(#soft)"/>
+  <ellipse cx="1550" cy="835" rx="540" ry="410" fill="url(#violet)" filter="url(#soft)"/>
+  <ellipse cx="1130" cy="140" rx="340" ry="240" fill="url(#violet)" opacity="0.58" filter="url(#soft)"/>
+  <path d="M-85 760C240 510 548 626 745 832C936 1032 1198 1071 1450 892C1660 744 1794 716 2005 801V1130H-85Z" fill="#061026" fill-opacity="0.28"/>
+  <g transform="rotate(-10 960 540)">
+    <rect x="428" y="232" width="1070" height="610" rx="116" fill="url(#glass)" stroke="url(#stroke)" stroke-width="2"/>
+    <rect x="458" y="262" width="1010" height="550" rx="92" fill="#d9f8ff" fill-opacity="0.025" stroke="#ffffff" stroke-opacity="0.12"/>
+    <path d="M506 352C762 243 1076 294 1357 421" fill="none" stroke="#ffffff" stroke-opacity="0.21" stroke-width="18" stroke-linecap="round"/>
+  </g>
+  <g opacity="0.58">
+    <circle cx="286" cy="772" r="4" fill="#d9f8ff"/><circle cx="332" cy="708" r="3" fill="#ffffff"/>
+    <circle cx="1620" cy="282" r="4" fill="#d9f8ff"/><circle cx="1702" cy="336" r="2" fill="#ffffff"/>
+    <circle cx="1494" cy="190" r="2" fill="#ffffff"/><circle cx="742" cy="142" r="3" fill="#d9f8ff"/>
+  </g>
+  <text x="124" y="926" fill="#effbff" fill-opacity="0.84" font-family="sans-serif" font-size="32" font-weight="600" letter-spacing="12">AUREON</text>
+  <text x="127" y="968" fill="#c7e8ff" fill-opacity="0.54" font-family="sans-serif" font-size="16" letter-spacing="4">LIQUID GLASS</text>
+</svg>

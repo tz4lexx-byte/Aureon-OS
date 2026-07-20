@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Aureon Liquid Glass defaults
+Comment=Apply the reversible default Aureon appearance once for the disposable preview user
+Exec=/usr/libexec/aureon/aureon-apply-appearance
+OnlyShowIn=KDE;
+NoDisplay=true
+StartupNotify=false
+X-KDE-autostart-phase=2

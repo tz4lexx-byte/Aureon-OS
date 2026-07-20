@@ -1,0 +1,25 @@
+#!/bin/sh
+# Apply the Liquid Glass wallpaper one time in the disposable preview session.
+# The system look-and-feel/color scheme is already supplied by /etc/skel.  This
+# helper only supplies the initial wallpaper after Plasma's DBus session exists,
+# then leaves future choices entirely to the user.
+set -eu
+
+if [ "$(id -un)" != "aureon" ]; then
+    exit 0
+fi
+
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+marker="${config_home}/aureon/liquid-glass-v1-applied"
+wallpaper="/usr/share/wallpapers/AureonLiquidGlass/contents/images/1920x1080.svg"
+
+if [ -e "$marker" ] || [ ! -r "$wallpaper" ]; then
+    exit 0
+fi
+
+if command -v plasma-apply-wallpaperimage >/dev/null 2>&1; then
+    if plasma-apply-wallpaperimage "$wallpaper"; then
+        mkdir -p "${config_home}/aureon"
+        : > "$marker"
+    fi
+fi

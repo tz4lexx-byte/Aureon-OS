@@ -65,6 +65,19 @@ nada. Para otra sesión cambia únicamente `--session-id`, por ejemplo
 `aur-02`. La imagen base queda de solo lectura y el estado de la sesión vive
 en `work/qemu-desktop/preview-09/sessions/aur-01/`.
 
+## Ver el nuevo tema Liquid Glass
+
+Las imágenes ya creadas no se modifican. Para incluir el tema Liquid Glass,
+los diagnósticos locales y sus assets SVG en una nueva imagen, usa un ID nuevo
+cuando tengas al menos 35 GiB libres:
+
+```powershell
+wsl.exe -d Ubuntu-24.04 --cd /mnt/c/Users/pc/Documents/Codex/2026-07-18/aureon-os -- bash -lc 'sudo -E /usr/bin/python3 tools/aureon-desktop-preview --build-id preview-10 --execute --allow-build-network'
+```
+
+La red solo se usa durante la descarga de paquetes Fedora del build. La nueva
+VM seguirá sin red, sin carpetas compartidas y sin acceso a discos físicos.
+
 ## Límites de esta fase
 
 - Es una preview de desarrollo, no una versión para instalar en hardware real.

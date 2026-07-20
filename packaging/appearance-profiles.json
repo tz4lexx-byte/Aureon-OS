@@ -1,0 +1,36 @@
+{
+  "schema": "aureon.appearance-profiles",
+  "version": 1,
+  "default_profile": "balanced",
+  "profiles": {
+    "off": {
+      "description": "Sin transparencia adicional; máxima legibilidad y menor coste visual.",
+      "blur": "disabled",
+      "transparency": "disabled",
+      "motion": "reduced"
+    },
+    "lite": {
+      "description": "Transparencia sutil para paneles y controles flotantes.",
+      "blur": "low",
+      "transparency": "low",
+      "motion": "normal"
+    },
+    "balanced": {
+      "description": "Perfil Liquid Glass predeterminado: capas suaves, contraste alto y panel flotante.",
+      "blur": "moderate",
+      "transparency": "moderate",
+      "motion": "normal"
+    },
+    "ultra": {
+      "description": "Reservado para hardware que haya pasado la medición visual; no se activa automáticamente.",
+      "blur": "high",
+      "transparency": "high",
+      "motion": "normal"
+    }
+  },
+  "accessibility": {
+    "high_contrast_preserves_user_choice": true,
+    "reduce_motion_preserves_user_choice": true,
+    "reduce_transparency_preserves_user_choice": true
+  }
+}
