@@ -1,0 +1,2260 @@
+#!/usr/bin/env python3
+"""Safe, dependency-free command-line entry point for Aureon OS development.
+
+``doctor`` is a read-only preflight, while ``build`` and ``image`` print
+deterministic dry-run plans.  The deliberately narrow ``test-smoke`` runner is
+the only state-changing Phase 0 command: it runs only as root inside Linux/WSL,
+uses fixed virtual-artifact paths, and never accepts a host disk as input.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+
+PROGRAM_NAME = "aureon-dev"
+PREFLIGHT_NOT_READY_EXIT_CODE = 1
+NOT_IMPLEMENTED_EXIT_CODE = 2
+WORKSPACE_REJECTED_EXIT_CODE = 3
+UNSAFE_INPUT_EXIT_CODE = 4
+RUNNER_FAILURE_EXIT_CODE = 6
+MINIMUM_PYTHON_VERSION = (3, 10)
+
+# The dry-run manifest is deliberately a stable, machine-independent contract.
+# It is printed to stdout only; this Phase 0 increment never writes it to disk.
+MANIFEST_SCHEMA = "aureon.build-manifest"
+MANIFEST_VERSION = 1
+DEFAULT_BUILD_ID = "dev"
+BUILD_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,62}")
+DEFAULT_WSL_DISTRIBUTION = "Ubuntu-24.04"
+WSL_DISTRIBUTION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+SMOKE_TIMEOUT_DEFAULT_SECONDS = 600
+SMOKE_TIMEOUT_MIN_SECONDS = 30
+SMOKE_TIMEOUT_MAX_SECONDS = 900
+SMOKE_STAGE_TIMEOUT_SECONDS = 1800
+SMOKE_MEMORY_MIB = 4096
+SMOKE_VCPUS = 2
+SMOKE_IMAGE_SIZE_BYTES = 10 * 1024 * 1024 * 1024
+PHASE0_BASE_REFERENCE = (
+    "quay.io/fedora/fedora-bootc@sha256:"
+    "86cd97f1e7962e30f52f35ae1c0719299df4f681492b133ea4bcdb74d154fb92"
+)
+PHASE0_IMAGE_BUILDER_REFERENCE = (
+    "ghcr.io/osbuild/image-builder-cli@sha256:"
+    "700368cfa3e78b25fb4fe02a87cedf1a5bc0cb142d7287c8c6fff72fd09228f5"
+)
+PHASE0_PODMAN_ROOT = Path("/var/lib/aureon-phase0-podman")
+PHASE0_PODMAN_STORE = PHASE0_PODMAN_ROOT / "storage"
+PHASE0_PODMAN_RUNROOT = Path("/run/aureon-phase0-podman")
+PHASE0_PODMAN_CONFIG_DIR = PHASE0_PODMAN_ROOT / "config"
+PHASE0_OVMF_CODE = Path("/usr/share/OVMF/OVMF_CODE_4M.fd")
+PHASE0_OVMF_VARS = Path("/usr/share/OVMF/OVMF_VARS_4M.fd")
+MINIMUM_SMOKE_FREE_BYTES = 20 * 1024 * 1024 * 1024
+WINDOWS_RESERVED_DEVICE_BASENAMES = frozenset(
+    ("con", "nul", "aux", "prn")
+    + tuple("com{0}".format(index) for index in range(1, 10))
+    + tuple("lpt{0}".format(index) for index in range(1, 10))
+)
+DECLARED_INPUTS = (
+    "system",
+    "packaging",
+    "kernel-config",
+    "desktop",
+    "services",
+    "installer",
+    "recovery",
+    "tools/aureon-dev",
+)
+
+# This is intentionally independent of the caller's current directory. The
+# extensionless entry point lives at <checkout>/tools/aureon-dev.
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+
+FOUND = "found"
+NOT_FOUND = "not found"
+NOT_VERIFIED = "not verified"
+
+
+@dataclass(frozen=True)
+class PreflightCheck:
+    """A read-only check required for the Phase 0 image/VM milestone."""
+
+    name: str
+    state: str
+    detail: str
+    required: bool = True
+
+
+@dataclass(frozen=True)
+class WslQueryResult:
+    """Minimal result shape for an explicitly read-only WSL status query."""
+
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+@dataclass(frozen=True)
+class SmokePaths:
+    """All Phase 0 smoke artifacts for one immutable build identifier."""
+
+    build_root: Path
+    image_root: Path
+    work_root: Path
+    manifest: Path
+    result: Path
+    oci_build_log: Path
+    conversion_log: Path
+    conversion_cid: Path
+    conversion_cleanup_log: Path
+    derived_oci: Path
+    qcow2_evidence: Path
+    disk: Path
+    buildlog: Path
+    osbuild_manifest: Path
+    vars_copy: Path
+    overlay: Path
+    serial_log: Path
+    qemu_log: Path
+    smoke: Path
+
+
+class SmokeRunnerError(RuntimeError):
+    """Raised when a bounded Phase 0 runner precondition or stage fails."""
+
+
+PENDING_COMMANDS = {
+    "run": "Boot an isolated graphical VM using an explicitly named virtual disk.",
+    "run-headless": "Boot an isolated headless VM and capture its serial console.",
+    "snapshot": "Create or inspect a snapshot for an explicitly named virtual disk.",
+    "test-update": "Exercise a simulated atomic update only on an isolated VM snapshot.",
+    "test-rollback": "Exercise rollback only on an isolated VM snapshot.",
+    "test-ui": "Run non-destructive UI checks against an isolated test image.",
+    "benchmark": "Collect documented performance measurements from an isolated test run.",
+    "collect-logs": "Copy selected diagnostics from an explicitly named test artifact directory.",
+    "clean": "Remove only explicitly generated build artifacts after a dry-run summary.",
+}
+
+
+class WorkspaceScopeError(ValueError):
+    """Raised when a requested workspace is not safely inside this checkout."""
+
+
+class PlanValidationError(ValueError):
+    """Raised when a dry-run plan requests an unsafe or ambiguous input."""
+
+
+def _windows_path_components(path):
+    """Yield path components using both Windows and POSIX separators.
+
+    Planning input must remain portable even when the CLI is run in WSL or on
+    Linux.  Treating both separators as delimiters prevents a Linux dry-run
+    from accepting a destination that Windows would interpret differently.
+    """
+
+    return tuple(
+        component
+        for component in re.split(r"[\\\\/]+", os.fspath(path))
+        if component and component not in {".", ".."}
+    )
+
+
+def is_windows_reserved_name(name):
+    """Return whether one Windows path component denotes a device alias."""
+
+    normalized = str(name).rstrip(" .")
+    if not normalized:
+        return False
+    basename = normalized.split(".", 1)[0].rstrip(" ").casefold()
+    return basename in WINDOWS_RESERVED_DEVICE_BASENAMES
+
+
+def validate_windows_portable_relative_path(path, label):
+    """Reject Windows-reserved or lossy components below the checkout root."""
+
+    for component in _windows_path_components(path):
+        if component.endswith((".", " ")):
+            raise PlanValidationError(
+                "{0} contains a Windows-unsafe path component ending in '.' or space: '{1}'"
+                .format(label, component)
+            )
+        if is_windows_reserved_name(component):
+            raise PlanValidationError(
+                "{0} contains a Windows-reserved device name: '{1}'".format(label, component)
+            )
+
+
+def is_remote_or_unc_path(path):
+    """Recognize UNC paths and URI-style locations that must stay local-only."""
+
+    raw = os.fspath(path).strip()
+    windows = raw.replace("/", "\\")
+    return windows.startswith("\\\\") or bool(
+        re.match(r"^[a-z][a-z0-9+.-]*://", raw, flags=re.IGNORECASE)
+    )
+
+
+def build_parser():
+    """Create the CLI parser without reading or changing the environment."""
+
+    parser = argparse.ArgumentParser(
+        prog=PROGRAM_NAME,
+        description=(
+            "Safe development entry point for Aureon OS. 'doctor' is read-only; "
+            "'build' and 'image' produce dry-run plans, while 'test-smoke' has "
+            "a separately gated Linux/WSL execution path."
+        ),
+    )
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=REPOSITORY_ROOT,
+        metavar="PATH",
+        help=(
+            "must resolve inside this checkout (plans always use the canonical "
+            "checkout root; paths outside it are rejected)"
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="run the read-only Phase 0 environment preflight",
+        description=(
+            "Read-only environment inspection. It never installs tools, starts "
+            "VMs, creates images, or writes to the workspace. A non-zero status "
+            "means one or more Phase 0 requirements are missing or unverified."
+        ),
+    )
+    doctor_parser.set_defaults(command="doctor")
+
+    def add_plan_arguments(command_parser, include_disk=False):
+        """Add only declarative, fail-closed arguments to a planning command."""
+
+        command_parser.add_argument(
+            "--build-id",
+            default=DEFAULT_BUILD_ID,
+            metavar="ID",
+            help="safe build identifier (default: {0})".format(DEFAULT_BUILD_ID),
+        )
+        command_parser.add_argument(
+            "--manifest",
+            type=Path,
+            metavar="PATH",
+            help="planned manifest path under build/<build-id>/ (never written yet)",
+        )
+        mode = command_parser.add_mutually_exclusive_group()
+        mode.add_argument(
+            "--dry-run",
+            dest="execution_mode",
+            action="store_const",
+            const="dry-run",
+            help="print the versioned plan without creating artifacts (default)",
+        )
+        mode.add_argument(
+            "--execute",
+            dest="execution_mode",
+            action="store_const",
+            const="execute",
+            help="reserved; fails closed until a verified implementation exists",
+        )
+        command_parser.set_defaults(execution_mode="dry-run")
+        if include_disk:
+            command_parser.add_argument(
+                "--disk",
+                type=Path,
+                metavar="PATH",
+                help="planned .qcow2 output under images/<build-id>/ (never written yet)",
+            )
+
+    build_parser = subparsers.add_parser(
+        "build",
+        help="plan a build manifest without running a builder",
+        description=(
+            "Print a deterministic, versioned build manifest. The default is "
+            "dry-run and never invokes WSL, container tooling, the network, or writes files."
+        ),
+    )
+    add_plan_arguments(build_parser)
+    build_parser.set_defaults(command="build")
+
+    image_parser = subparsers.add_parser(
+        "image",
+        help="plan a qcow2 image without creating a disk",
+        description=(
+            "Print a deterministic image plan. Only a repository-local .qcow2 "
+            "target is accepted; physical disks are always rejected."
+        ),
+    )
+    add_plan_arguments(image_parser, include_disk=True)
+    image_parser.set_defaults(command="image")
+
+    smoke_parser = subparsers.add_parser(
+        "test-smoke",
+        help="plan or execute the bounded OCI-to-QEMU Phase 0 smoke test",
+        description=(
+            "The default prints a deterministic no-write plan. '--execute' is "
+            "available only as root inside Linux/WSL and creates new virtual "
+            "artifacts below this checkout; it never accepts host disk paths."
+        ),
+    )
+    smoke_parser.add_argument(
+        "--build-id",
+        default=DEFAULT_BUILD_ID,
+        metavar="ID",
+        help="new safe build identifier; required to be unused for --execute",
+    )
+    smoke_mode = smoke_parser.add_mutually_exclusive_group()
+    smoke_mode.add_argument(
+        "--dry-run",
+        dest="execution_mode",
+        action="store_const",
+        const="dry-run",
+        help="print the fixed smoke plan without writing or invoking WSL/Podman/QEMU (default)",
+    )
+    smoke_mode.add_argument(
+        "--execute",
+        dest="execution_mode",
+        action="store_const",
+        const="execute",
+        help="run the reviewed Linux/WSL-only smoke chain using new virtual artifacts",
+    )
+    smoke_parser.set_defaults(execution_mode="dry-run")
+    smoke_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=SMOKE_TIMEOUT_DEFAULT_SECONDS,
+        metavar="SECONDS",
+        help="guest boot timeout from {0} to {1} seconds (default: {2})".format(
+            SMOKE_TIMEOUT_MIN_SECONDS,
+            SMOKE_TIMEOUT_MAX_SECONDS,
+            SMOKE_TIMEOUT_DEFAULT_SECONDS,
+        ),
+    )
+    smoke_parser.add_argument(
+        "--accel",
+        choices=("auto", "kvm", "tcg"),
+        default="auto",
+        help="QEMU acceleration policy; auto uses KVM when available, otherwise TCG",
+    )
+    smoke_parser.set_defaults(command="test-smoke")
+
+    for command, contract in PENDING_COMMANDS.items():
+        pending_parser = subparsers.add_parser(
+            command,
+            help="reserved: {0}".format(contract),
+            description=(
+                "Reserved command contract: {0} This command is not implemented "
+                "yet and exits without making changes."
+            ).format(contract),
+        )
+        pending_parser.set_defaults(command=command)
+
+    return parser
+
+
+def canonical_workspace(workspace):
+    """Resolve a workspace and reject anything that escapes this checkout.
+
+    ``resolve(strict=False)`` deliberately follows already-present symlinks, so
+    a syntactically in-tree path that resolves outside the checkout is rejected
+    too. It performs no writes.
+    """
+
+    try:
+        resolved = Path(workspace).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise WorkspaceScopeError("could not resolve '{0}': {1}".format(workspace, error))
+
+    try:
+        resolved.relative_to(REPOSITORY_ROOT)
+    except ValueError:
+        raise WorkspaceScopeError(
+            "'{0}' resolves outside canonical checkout '{1}'".format(
+                resolved, REPOSITORY_ROOT
+            )
+        )
+    return resolved
+
+
+def validate_build_id(build_id):
+    """Validate a stable identifier before it contributes to any artifact path."""
+
+    if not isinstance(build_id, str):
+        raise PlanValidationError(
+            "invalid build id '{0}'; use 1-63 lowercase letters, digits, '.', '_' or '-'"
+            .format(build_id)
+        )
+    if build_id.endswith((".", " ")):
+        raise PlanValidationError(
+            "invalid build id '{0}'; it must not end in '.' or space".format(build_id)
+        )
+    if not BUILD_ID_PATTERN.fullmatch(build_id):
+        raise PlanValidationError(
+            "invalid build id '{0}'; use 1-63 lowercase letters, digits, '.', '_' or '-'"
+            .format(build_id)
+        )
+    if ".." in build_id:
+        raise PlanValidationError("invalid build id '{0}'; '..' is not allowed".format(build_id))
+    if is_windows_reserved_name(build_id):
+        raise PlanValidationError(
+            "invalid build id '{0}'; Windows-reserved device names are not allowed".format(build_id)
+        )
+    return build_id
+
+
+def is_physical_disk_path(path):
+    """Recognize device-style paths before normal path resolution can disguise them."""
+
+    raw = str(path)
+    lower = raw.lower()
+    windows = lower.replace("/", "\\")
+    return (
+        lower == "/dev"
+        or lower.startswith("/dev/")
+        or windows.startswith(r"\\.\physicaldrive")
+        or windows.startswith(r"\\?\physicaldrive")
+        or windows.startswith(r"\\.\globalroot\device\harddisk")
+        or windows.startswith(r"\\?\globalroot\device\harddisk")
+        or windows.startswith(r"\\.\volume")
+        or windows.startswith(r"\\?\volume")
+        or bool(re.match(r"^\\\\[.?]\\[a-z]:", windows))
+    )
+
+
+def _repository_paths(path, label, repository_root=REPOSITORY_ROOT):
+    """Return lexical and resolved forms of a path proven to stay in the checkout.
+
+    The lexical form is retained for declared inputs so every path component can
+    be checked for links before directory traversal.  The resolved form is used
+    for planned destinations and relative manifest rendering.
+    """
+
+    root = Path(repository_root).resolve()
+    raw = Path(path).expanduser()
+    candidate = raw if raw.is_absolute() else root / raw
+    try:
+        # ``abspath`` normalizes ``.`` and ``..`` without following symlinks.
+        # That lets us distinguish an in-tree symlink from its resolved target.
+        lexical = Path(os.path.abspath(os.fspath(candidate)))
+    except (OSError, RuntimeError) as error:
+        raise PlanValidationError("could not normalize {0} '{1}': {2}".format(label, path, error))
+
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError:
+        raise PlanValidationError(
+            "{0} '{1}' is outside canonical checkout '{2}'".format(label, path, root)
+        )
+    validate_windows_portable_relative_path(relative, label)
+
+    try:
+        resolved = lexical.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise PlanValidationError("could not resolve {0} '{1}': {2}".format(label, path, error))
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise PlanValidationError(
+            "{0} '{1}' resolves outside canonical checkout '{2}'".format(label, resolved, root)
+        )
+    return lexical, resolved
+
+
+def repository_path(path, label, repository_root=REPOSITORY_ROOT):
+    """Resolve a path against the checkout and reject escapes or symlink targets.
+
+    Relative artifact paths are deliberately rooted at the checkout rather than
+    the caller's current directory. This makes plans reproducible and avoids
+    surprising writes in a later implementation.
+    """
+
+    return _repository_paths(path, label, repository_root)[1]
+
+
+def require_path_below(path, parent, label):
+    """Require a planned path to be contained by its build-specific root."""
+
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        raise PlanValidationError("{0} must stay below '{1}'".format(label, parent))
+    return path
+
+
+def validate_manifest_path(build_id, manifest_path=None, repository_root=REPOSITORY_ROOT):
+    """Return a repository-local JSON manifest path for one safe build ID."""
+
+    build_id = validate_build_id(build_id)
+    root = Path(repository_root).resolve()
+    build_root = root / "build" / build_id
+    requested = manifest_path if manifest_path is not None else build_root / "manifest.json"
+    manifest = repository_path(requested, "manifest path", root)
+    require_path_below(manifest, build_root, "manifest path")
+    if manifest.suffix != ".json":
+        raise PlanValidationError("manifest path must use the .json extension")
+    return manifest
+
+
+def validate_qcow2_path(build_id, disk_path=None, repository_root=REPOSITORY_ROOT):
+    """Return a repository-local qcow2 destination and reject host devices."""
+
+    build_id = validate_build_id(build_id)
+    root = Path(repository_root).resolve()
+    image_root = root / "images" / build_id
+    requested = disk_path if disk_path is not None else image_root / "aureon-base.qcow2"
+    if is_physical_disk_path(requested):
+        raise PlanValidationError("physical disk paths are never accepted as image targets")
+    disk = repository_path(requested, "disk path", root)
+    require_path_below(disk, image_root, "disk path")
+    if disk.suffix != ".qcow2":
+        raise PlanValidationError("disk path must use the .qcow2 extension")
+    return disk
+
+
+def _first_symlink_component(path, repository_root):
+    """Return the first in-tree link on a lexical path, if one is present."""
+
+    root = Path(repository_root).resolve()
+    current = root
+    try:
+        parts = Path(path).relative_to(root).parts
+    except ValueError:
+        raise PlanValidationError(
+            "declared input '{0}' is outside canonical checkout '{1}'".format(path, root)
+        )
+    try:
+        for part in parts:
+            current = current / part
+            if current.is_symlink():
+                return current
+    except OSError as error:
+        raise PlanValidationError("could not inspect declared input '{0}': {1}".format(path, error))
+    return None
+
+
+def _declared_regular_files(path, repository_root=REPOSITORY_ROOT):
+    """Yield safe regular files in stable order without traversing any link."""
+
+    root = Path(repository_root).resolve()
+    lexical, resolved = _repository_paths(path, "declared input", root)
+    symlink = _first_symlink_component(lexical, root)
+    if symlink is not None:
+        raise PlanValidationError(
+            "declared input '{0}' traverses symlink '{1}'".format(lexical, symlink)
+        )
+
+    try:
+        if lexical.is_file():
+            yield resolved
+            return
+        if not lexical.is_dir():
+            raise PlanValidationError(
+                "declared input '{0}' is missing or not a regular path".format(lexical)
+            )
+        children = sorted(lexical.iterdir(), key=lambda child: child.name)
+    except OSError as error:
+        raise PlanValidationError("could not inspect declared input '{0}': {1}".format(lexical, error))
+
+    for child in children:
+        yield from _declared_regular_files(child, root)
+
+
+def declared_input_records(repository_root=REPOSITORY_ROOT, input_paths=DECLARED_INPUTS):
+    """Hash only declared repository inputs, in path order and without metadata."""
+
+    root = Path(repository_root).resolve()
+    files = []
+    for declared in input_paths:
+        lexical, _ = _repository_paths(declared, "declared input", root)
+        files.extend(_declared_regular_files(lexical, root))
+
+    records = []
+    for source in sorted(files, key=lambda candidate: candidate.relative_to(root).as_posix()):
+        # Revalidate just before opening so a path that changed into a symlink
+        # after collection is rejected before content is read or hashed.
+        lexical, verified_source = _repository_paths(source, "declared input", root)
+        symlink = _first_symlink_component(lexical, root)
+        if symlink is not None:
+            raise PlanValidationError(
+                "declared input '{0}' traverses symlink '{1}'".format(lexical, symlink)
+            )
+        relative = verified_source.relative_to(root).as_posix()
+        digest = hashlib.sha256()
+        try:
+            with verified_source.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as error:
+            raise PlanValidationError(
+                "could not hash declared input '{0}': {1}".format(verified_source, error)
+            )
+        records.append({"path": relative, "sha256": digest.hexdigest()})
+
+    canonical_records = json.dumps(
+        records, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    return records, hashlib.sha256(canonical_records).hexdigest()
+
+
+def relative_repository_path(path, repository_root=REPOSITORY_ROOT):
+    """Render only a stable relative path in manifests, never a host-specific path."""
+
+    root = Path(repository_root).resolve()
+    return repository_path(path, "repository path", root).relative_to(root).as_posix()
+
+
+def validate_plan_destinations(
+    command, build_id, manifest_path=None, disk_path=None, repository_root=REPOSITORY_ROOT
+):
+    """Validate every planned output before any declared input can be hashed."""
+
+    if command not in {"build", "image"}:
+        raise PlanValidationError("unsupported planning command '{0}'".format(command))
+    build_id = validate_build_id(build_id)
+    root = Path(repository_root).resolve()
+    build_root = root / "build" / build_id
+    manifest = validate_manifest_path(build_id, manifest_path, root)
+    oci_layout = repository_path(build_root / "oci", "OCI layout path", root)
+    require_path_below(oci_layout, build_root, "OCI layout path")
+    destinations = {"manifest": manifest, "oci_layout": oci_layout}
+    if command == "image":
+        destinations["disk"] = validate_qcow2_path(build_id, disk_path, root)
+    return build_id, root, destinations
+
+
+def create_dry_run_manifest(command, build_id, manifest_path=None, disk_path=None, repository_root=REPOSITORY_ROOT):
+    """Build a deterministic plan without invoking a builder or creating an artifact."""
+
+    build_id, root, destinations = validate_plan_destinations(
+        command, build_id, manifest_path, disk_path, repository_root
+    )
+    records, digest = declared_input_records(root)
+    paths = {
+        label: relative_repository_path(destination, root)
+        for label, destination in destinations.items()
+    }
+
+    return {
+        "build_id": build_id,
+        "command": command,
+        "execution": {
+            "mode": "dry-run",
+            "network": "not invoked",
+            "writes": False,
+        },
+        "inputs": {
+            "algorithm": "sha256",
+            "digest": digest,
+            "files": records,
+        },
+        "paths": paths,
+        "schema": MANIFEST_SCHEMA,
+        "version": MANIFEST_VERSION,
+    }
+
+
+def report_plan_rejection(error, output):
+    """Report a rejected plan without claiming that no inputs were inspected."""
+
+    print("{0}: rejected plan: {1}".format(PROGRAM_NAME, error), file=output)
+    print(
+        "No artifacts were created or changed. No builder, WSL, container runtime, network, "
+        "or virtual machine was invoked, and no physical-disk target was accepted.",
+        file=output,
+    )
+    return UNSAFE_INPUT_EXIT_CODE
+
+
+def run_plan(command, workspace, build_id, manifest_path, disk_path, execution_mode, output):
+    """Validate and print a plan, or fail closed for the unimplemented execute mode."""
+
+    try:
+        canonical_workspace(workspace)
+        validate_plan_destinations(
+            command, build_id, manifest_path=manifest_path, disk_path=disk_path
+        )
+    except WorkspaceScopeError as error:
+        return report_workspace_rejection(error, output)
+    except PlanValidationError as error:
+        return report_plan_rejection(error, output)
+
+    if execution_mode == "execute":
+        print("{0}: '{1} --execute' is not implemented or verified yet.".format(PROGRAM_NAME, command), file=output)
+        print(
+            "Execution fails closed before hashing declared inputs or invoking a builder, WSL, "
+            "container runtime, network, virtual machine, image, or disk.",
+            file=output,
+        )
+        return NOT_IMPLEMENTED_EXIT_CODE
+
+    try:
+        manifest = create_dry_run_manifest(
+            command, build_id, manifest_path=manifest_path, disk_path=disk_path
+        )
+    except PlanValidationError as error:
+        return report_plan_rejection(error, output)
+
+    print(json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True), file=output)
+    return 0
+
+
+def validate_smoke_timeout(timeout_seconds):
+    """Validate the bounded guest-boot timeout before any operation begins."""
+
+    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool):
+        raise PlanValidationError("smoke timeout must be an integer number of seconds")
+    if not SMOKE_TIMEOUT_MIN_SECONDS <= timeout_seconds <= SMOKE_TIMEOUT_MAX_SECONDS:
+        raise PlanValidationError(
+            "smoke timeout must be between {0} and {1} seconds".format(
+                SMOKE_TIMEOUT_MIN_SECONDS, SMOKE_TIMEOUT_MAX_SECONDS
+            )
+        )
+    return timeout_seconds
+
+
+def smoke_paths(build_id, repository_root=REPOSITORY_ROOT):
+    """Return the fixed, repository-local artifact topology for one smoke run."""
+
+    build_id = validate_build_id(build_id)
+    root = Path(repository_root).resolve()
+    build_root = root / "build" / build_id
+    image_root = root / "images" / build_id
+    work_root = root / "work" / "qemu" / build_id
+    paths = SmokePaths(
+        build_root=build_root,
+        image_root=image_root,
+        work_root=work_root,
+        manifest=build_root / "manifest.json",
+        result=build_root / "result.json",
+        oci_build_log=build_root / "oci-build.log",
+        conversion_log=build_root / "conversion.log",
+        conversion_cid=build_root / "conversion.cid",
+        conversion_cleanup_log=build_root / "conversion-cleanup.log",
+        derived_oci=build_root / "derived-oci.json",
+        qcow2_evidence=build_root / "qcow2.json",
+        disk=image_root / "aureon-base.qcow2",
+        buildlog=image_root / "aureon-base.buildlog",
+        osbuild_manifest=image_root / "aureon-base.osbuild-manifest.json",
+        vars_copy=work_root / "OVMF_VARS_4M.fd",
+        overlay=work_root / "smoke-overlay.qcow2",
+        serial_log=work_root / "serial.log",
+        qemu_log=work_root / "qemu.log",
+        smoke=work_root / "smoke.json",
+    )
+    for label, candidate in (
+        ("build artifact path", paths.build_root),
+        ("image artifact path", paths.image_root),
+        ("QEMU work path", paths.work_root),
+        ("qcow2 path", paths.disk),
+    ):
+        if label == "qcow2 path" and is_physical_disk_path(candidate):
+            raise PlanValidationError("physical disk paths are never accepted as image targets")
+        repository_path(candidate, label, root)
+        link = _first_symlink_component(candidate, root)
+        if link is not None:
+            raise PlanValidationError(
+                "{0} traverses symlink '{1}'; smoke artifacts require real in-tree directories".format(
+                    label, link
+                )
+            )
+    return paths
+
+
+def smoke_plan_paths(paths, repository_root=REPOSITORY_ROOT):
+    """Render smoke output paths relative to the checkout for stable evidence."""
+
+    root = Path(repository_root).resolve()
+    return {
+        "build_manifest": relative_repository_path(paths.manifest, root),
+        "build_result": relative_repository_path(paths.result, root),
+        "oci_build_log": relative_repository_path(paths.oci_build_log, root),
+        "conversion_log": relative_repository_path(paths.conversion_log, root),
+        "conversion_cid": relative_repository_path(paths.conversion_cid, root),
+        "conversion_cleanup_log": relative_repository_path(paths.conversion_cleanup_log, root),
+        "derived_oci": relative_repository_path(paths.derived_oci, root),
+        "qcow2_evidence": relative_repository_path(paths.qcow2_evidence, root),
+        "qcow2_base": relative_repository_path(paths.disk, root),
+        "qcow2_buildlog": relative_repository_path(paths.buildlog, root),
+        "osbuild_manifest": relative_repository_path(paths.osbuild_manifest, root),
+        "ovmf_variables": relative_repository_path(paths.vars_copy, root),
+        "qcow2_overlay": relative_repository_path(paths.overlay, root),
+        "serial_log": relative_repository_path(paths.serial_log, root),
+        "qemu_log": relative_repository_path(paths.qemu_log, root),
+        "smoke_evidence": relative_repository_path(paths.smoke, root),
+    }
+
+
+def validate_canonical_smoke_paths(paths, repository_root=REPOSITORY_ROOT):
+    """Prove a caller did not substitute any smoke artifact path outside its build ID."""
+
+    if not isinstance(paths, SmokePaths):
+        raise PlanValidationError("smoke paths must use the immutable SmokePaths topology")
+    root = Path(repository_root).resolve()
+    try:
+        build_id = Path(paths.build_root).name
+        expected = smoke_paths(build_id, root)
+    except (OSError, PlanValidationError) as error:
+        raise PlanValidationError("could not validate canonical smoke artifact paths: {0}".format(error)) from error
+    if paths != expected:
+        raise PlanValidationError(
+            "smoke artifact paths must exactly match the fixed build-ID topology under the checkout"
+        )
+    return expected
+
+
+def create_smoke_plan(
+    build_id,
+    timeout_seconds=SMOKE_TIMEOUT_DEFAULT_SECONDS,
+    acceleration="auto",
+    repository_root=REPOSITORY_ROOT,
+):
+    """Create a deterministic Phase 0 smoke plan without starting any tool."""
+
+    if acceleration not in {"auto", "kvm", "tcg"}:
+        raise PlanValidationError("smoke acceleration must be auto, kvm, or tcg")
+    timeout_seconds = validate_smoke_timeout(timeout_seconds)
+    paths = smoke_paths(build_id, repository_root)
+    records, digest = declared_input_records(repository_root)
+    return {
+        "build_id": validate_build_id(build_id),
+        "command": "test-smoke",
+        "constraints": {
+            "guest_network": "disabled",
+            "host_directories_mounted_in_guest": False,
+            "physical_block_devices": "forbidden",
+            "qemu_base_disk": "copy-on-write backing file only",
+            "workspace_artifacts_only": True,
+        },
+        "execution": {
+            "acceleration_policy": acceleration,
+            "image_size_bytes": SMOKE_IMAGE_SIZE_BYTES,
+            "memory_mib": SMOKE_MEMORY_MIB,
+            "mode": "dry-run",
+            "timeout_seconds": timeout_seconds,
+            "vcpus": SMOKE_VCPUS,
+            "writes": False,
+        },
+        "inputs": {
+            "algorithm": "sha256",
+            "base_image": PHASE0_BASE_REFERENCE,
+            "disk_image_builder": PHASE0_IMAGE_BUILDER_REFERENCE,
+            "digest": digest,
+            "files": records,
+        },
+        "paths": smoke_plan_paths(paths, repository_root),
+        "schema": "aureon.smoke-plan",
+        "version": 1,
+    }
+
+
+def _output_roots(paths):
+    """Return the only directories a real smoke run may create."""
+
+    return (paths.build_root, paths.image_root, paths.work_root)
+
+
+def require_unused_smoke_output_roots(paths, repository_root=REPOSITORY_ROOT):
+    """Fail closed rather than overwriting or cleaning an earlier smoke run."""
+
+    root = Path(repository_root).resolve()
+    paths = validate_canonical_smoke_paths(paths, root)
+    required_parents = (root / "build", root / "images")
+    for parent in required_parents:
+        link = _first_symlink_component(parent, root)
+        if link is not None:
+            raise PlanValidationError(
+                "smoke output parent traverses symlink '{0}'".format(link)
+            )
+        if not parent.is_dir():
+            raise PlanValidationError(
+                "required smoke output parent is missing or not a directory: '{0}'".format(parent)
+            )
+    # ``work/`` is intentionally ignored by Git because it contains only
+    # generated QEMU state.  A clean checkout may therefore lack both of these
+    # canonical parents.  They are created later with exclusive, in-tree checks.
+    for parent in (root / "work", root / "work" / "qemu"):
+        link = _first_symlink_component(parent, root)
+        if link is not None:
+            raise PlanValidationError(
+                "smoke output parent traverses symlink '{0}'".format(link)
+            )
+        if parent.exists() and (parent.is_symlink() or not parent.is_dir()):
+            raise PlanValidationError(
+                "smoke output parent is not a real directory: '{0}'".format(parent)
+            )
+    for output_root in _output_roots(paths):
+        if output_root.exists() or output_root.is_symlink():
+            raise PlanValidationError(
+                "refusing to overwrite existing smoke artifact directory '{0}'".format(
+                    output_root
+                )
+            )
+
+
+def _write_json_once(path, value):
+    """Create an evidence file exactly once; never replace a prior result."""
+
+    try:
+        with Path(path).open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, ensure_ascii=True, indent=2, sort_keys=True)
+            handle.write("\n")
+    except FileExistsError as error:
+        raise SmokeRunnerError("refusing to overwrite evidence '{0}'".format(path)) from error
+
+
+def _sha256_file(path):
+    """Return a content hash for a regular, non-link file."""
+
+    candidate = Path(path)
+    if candidate.is_symlink() or not candidate.is_file():
+        raise SmokeRunnerError("expected regular non-link file '{0}'".format(candidate))
+    digest = hashlib.sha256()
+    with candidate.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _runner_environment():
+    """Return a minimal deterministic environment with no proxy inheritance."""
+
+    return {
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    }
+
+
+def _trusted_linux_executable(path, label, repository_root=REPOSITORY_ROOT):
+    """Accept only an executable installed outside the checkout or Windows mounts."""
+
+    candidate = Path(path)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise SmokeRunnerError("{0} is unavailable at '{1}': {2}".format(label, candidate, error))
+    root = Path(repository_root).resolve()
+    if resolved == root or root in resolved.parents or str(resolved).startswith("/mnt/"):
+        raise SmokeRunnerError("{0} must not be loaded from the checkout or a Windows mount".format(label))
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise SmokeRunnerError("{0} is not an executable regular file: '{1}'".format(label, resolved))
+    return str(resolved)
+
+
+def _capture_command(argv, timeout_seconds, environment):
+    """Run a fixed argv command without a shell and return its stdout."""
+
+    try:
+        result = subprocess.run(
+            tuple(str(argument) for argument in argv),
+            check=False,
+            cwd="/",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SmokeRunnerError("command timed out after {0} seconds: {1}".format(timeout_seconds, argv[0])) from error
+    except OSError as error:
+        raise SmokeRunnerError("could not start command '{0}': {1}".format(argv[0], error)) from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().replace("\n", " ")
+        raise SmokeRunnerError(
+            "command exited {0}: {1}{2}".format(
+                result.returncode,
+                argv[0],
+                " ({0})".format(detail[:240]) if detail else "",
+            )
+        )
+    return result.stdout or ""
+
+
+def _terminate_process_group(process):
+    """Stop only the dedicated child process group created by this runner."""
+
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        process.terminate()
+    try:
+        process.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError:
+        process.kill()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        raise SmokeRunnerError("runner could not stop its own timed-out child process")
+
+
+def _run_logged_command(argv, log_path, timeout_seconds, environment):
+    """Run one reviewed command, preserving combined output in a new log file."""
+
+    destination = Path(log_path)
+    try:
+        with destination.open("xb") as log_handle:
+            process = subprocess.Popen(
+                tuple(str(argument) for argument in argv),
+                cwd="/",
+                env=environment,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            started = time.monotonic()
+            try:
+                returncode = process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired as error:
+                _terminate_process_group(process)
+                raise SmokeRunnerError(
+                    "command timed out after {0} seconds: {1}".format(timeout_seconds, argv[0])
+                ) from error
+    except FileExistsError as error:
+        raise SmokeRunnerError("refusing to overwrite log '{0}'".format(destination)) from error
+    except OSError as error:
+        raise SmokeRunnerError("could not start command '{0}': {1}".format(argv[0], error)) from error
+    duration = time.monotonic() - started
+    if returncode != 0:
+        raise SmokeRunnerError(
+            "command exited {0}: {1}; inspect '{2}'".format(returncode, argv[0], destination)
+        )
+    return {"duration_seconds": round(duration, 3), "returncode": returncode}
+
+
+def _select_acceleration(policy):
+    """Choose the documented accelerator without changing the host."""
+
+    kvm = Path("/dev/kvm")
+    available = kvm.exists() and os.access(kvm, os.R_OK | os.W_OK)
+    if policy == "kvm" and not available:
+        raise SmokeRunnerError("KVM was requested but /dev/kvm is not read/write available")
+    if policy == "tcg":
+        return "tcg", available
+    if available:
+        return "kvm", True
+    return "tcg", False
+
+
+def collect_smoke_runner_preflight(
+    repository_root=REPOSITORY_ROOT, acceleration_policy="auto", command_timeout=30
+):
+    """Verify execution-only prerequisites before creating any artifact directory."""
+
+    root = Path(repository_root).resolve()
+    if platform.system().lower() != "linux":
+        raise SmokeRunnerError(
+            "test-smoke --execute runs only inside Linux/WSL; it never bridges automatically from Windows"
+        )
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None or geteuid() != 0:
+        raise SmokeRunnerError(
+            "test-smoke --execute requires root inside Linux/WSL for the dedicated Podman store; it never elevates automatically"
+        )
+    if not root.is_dir() or root.is_symlink():
+        raise SmokeRunnerError("canonical checkout must be a real directory for an executing smoke run")
+    try:
+        free_bytes = shutil.disk_usage(root).free
+    except OSError as error:
+        raise SmokeRunnerError("could not inspect free workspace space: {0}".format(error)) from error
+    if free_bytes < MINIMUM_SMOKE_FREE_BYTES:
+        raise SmokeRunnerError(
+            "workspace has {0} free bytes; Phase 0 requires at least {1} and never deletes artifacts automatically".format(
+                free_bytes, MINIMUM_SMOKE_FREE_BYTES
+            )
+        )
+
+    podman = _trusted_linux_executable("/usr/bin/podman", "Podman", root)
+    qemu = _trusted_linux_executable("/usr/bin/qemu-system-x86_64", "QEMU", root)
+    qemu_img = _trusted_linux_executable("/usr/bin/qemu-img", "qemu-img", root)
+    for firmware, label in ((PHASE0_OVMF_CODE, "OVMF code"), (PHASE0_OVMF_VARS, "OVMF variables")):
+        if firmware.is_symlink() or not firmware.is_file() or not os.access(firmware, os.R_OK):
+            raise SmokeRunnerError("{0} must be a readable regular file at '{1}'".format(label, firmware))
+    for state_path, label in (
+        (PHASE0_PODMAN_STORE, "dedicated Podman store"),
+        (PHASE0_PODMAN_CONFIG_DIR, "dedicated Podman configuration"),
+    ):
+        if state_path.is_symlink() or not state_path.is_dir():
+            raise SmokeRunnerError("{0} is unavailable at '{1}'".format(label, state_path))
+    if PHASE0_PODMAN_RUNROOT.exists() and (
+        PHASE0_PODMAN_RUNROOT.is_symlink() or not PHASE0_PODMAN_RUNROOT.is_dir()
+    ):
+        raise SmokeRunnerError(
+            "dedicated Podman runroot is not a real directory: '{0}'".format(PHASE0_PODMAN_RUNROOT)
+        )
+
+    source_storage = root / "packaging" / "phase0-container-storage.conf"
+    source_containers = root / "packaging" / "phase0-containers.conf"
+    installed_storage = PHASE0_PODMAN_CONFIG_DIR / "storage.conf"
+    installed_containers = PHASE0_PODMAN_CONFIG_DIR / "containers.conf"
+    for source, installed, label in (
+        (source_storage, installed_storage, "storage.conf"),
+        (source_containers, installed_containers, "containers.conf"),
+    ):
+        if _sha256_file(source) != _sha256_file(installed):
+            raise SmokeRunnerError(
+                "dedicated Podman {0} differs from the reviewed repository configuration".format(label)
+            )
+
+    environment = _runner_environment()
+    podman_prefix = (podman, "--root", str(PHASE0_PODMAN_STORE), "--runroot", str(PHASE0_PODMAN_RUNROOT))
+    for reference, label in (
+        (PHASE0_BASE_REFERENCE, "immutable Fedora bootc base"),
+        (PHASE0_IMAGE_BUILDER_REFERENCE, "immutable Image Builder CLI"),
+    ):
+        try:
+            _capture_command(podman_prefix + ("image", "exists", reference), command_timeout, environment)
+        except SmokeRunnerError as error:
+            raise SmokeRunnerError(
+                "required local {0} is unavailable in the dedicated store; the runner never pulls images: {1}".format(
+                    label, error
+                )
+            ) from error
+    acceleration, kvm_available = _select_acceleration(acceleration_policy)
+    return {
+        "acceleration": acceleration,
+        "dedicated_store": str(PHASE0_PODMAN_STORE),
+        "executables": {"podman": podman, "qemu": qemu, "qemu_img": qemu_img},
+        "free_bytes": free_bytes,
+        "kvm_available": kvm_available,
+        "ovmf_code": str(PHASE0_OVMF_CODE),
+        "ovmf_vars": str(PHASE0_OVMF_VARS),
+    }
+
+
+def _ensure_dedicated_runroot():
+    """Create only the documented ephemeral Podman runroot when a WSL boot cleared it."""
+
+    try:
+        PHASE0_PODMAN_RUNROOT.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except FileExistsError:
+        if PHASE0_PODMAN_RUNROOT.is_symlink() or not PHASE0_PODMAN_RUNROOT.is_dir():
+            raise SmokeRunnerError("dedicated Podman runroot changed into an unsafe path")
+    except OSError as error:
+        raise SmokeRunnerError(
+            "could not create documented dedicated Podman runroot '{0}': {1}".format(
+                PHASE0_PODMAN_RUNROOT, error
+            )
+        ) from error
+
+
+def _utc_timestamp():
+    """Render an evidence timestamp without consulting a network clock."""
+
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _create_smoke_artifact_roots(paths, plan, repository_root=REPOSITORY_ROOT):
+    """Create only the three new build-ID roots after all preflight gates pass."""
+
+    root = Path(repository_root).resolve()
+    require_unused_smoke_output_roots(paths, root)
+    created = []
+    try:
+        for parent in (root / "work", root / "work" / "qemu"):
+            if not parent.exists():
+                parent.mkdir(mode=0o700)
+        for output_root in _output_roots(paths):
+            output_root.mkdir(mode=0o700)
+            created.append(output_root)
+        executed_plan = dict(plan)
+        executed_plan["execution"] = dict(plan["execution"])
+        executed_plan["execution"]["mode"] = "execute"
+        executed_plan["execution"]["writes"] = True
+        _write_json_once(paths.manifest, executed_plan)
+    except (OSError, SmokeRunnerError) as error:
+        raise SmokeRunnerError(
+            "could not create the exclusive smoke artifact roots {0}: {1}".format(created, error)
+        ) from error
+
+
+def _artifact_record(path, repository_root=REPOSITORY_ROOT):
+    """Return a relative evidence record for one reviewed regular output file."""
+
+    candidate = Path(path)
+    return {
+        "path": relative_repository_path(candidate, repository_root),
+        "sha256": _sha256_file(candidate),
+        "size_bytes": candidate.stat().st_size,
+    }
+
+
+def _assert_expected_image_outputs(paths):
+    """Reject surprise converter output before attaching any disk to QEMU."""
+
+    expected = {
+        paths.disk.name,
+        paths.buildlog.name,
+        paths.osbuild_manifest.name,
+    }
+    try:
+        observed = {entry.name for entry in paths.image_root.iterdir()}
+    except OSError as error:
+        raise SmokeRunnerError("could not inspect converter output: {0}".format(error)) from error
+    if observed != expected:
+        raise SmokeRunnerError(
+            "converter output must contain exactly {0}; observed {1}".format(
+                sorted(expected), sorted(observed)
+            )
+        )
+    for path in (paths.disk, paths.buildlog, paths.osbuild_manifest):
+        if path.is_symlink() or not path.is_file():
+            raise SmokeRunnerError("converter output must be a regular non-link file: '{0}'".format(path))
+
+
+def _inspect_qcow2(paths, qemu_img, environment, repository_root=REPOSITORY_ROOT):
+    """Check the generated base disk before it can be used as an overlay backing file."""
+
+    _assert_expected_image_outputs(paths)
+    try:
+        info = json.loads(
+            _capture_command(
+                (qemu_img, "info", "--output=json", str(paths.disk)), 60, environment
+            )
+        )
+    except json.JSONDecodeError as error:
+        raise SmokeRunnerError("qemu-img returned invalid JSON while inspecting the base disk") from error
+    if info.get("format") != "qcow2":
+        raise SmokeRunnerError("converter output is not qcow2: '{0}'".format(info.get("format")))
+    virtual_size = info.get("virtual-size")
+    if not isinstance(virtual_size, int) or virtual_size <= 0 or virtual_size > 16 * 1024**3:
+        raise SmokeRunnerError("converter output has an unsafe virtual size: '{0}'".format(virtual_size))
+    integrity = _capture_command((qemu_img, "check", str(paths.disk)), 120, environment).strip()
+    records = {
+        "buildlog": _artifact_record(paths.buildlog, repository_root),
+        "osbuild_manifest": _artifact_record(paths.osbuild_manifest, repository_root),
+        "qcow2": _artifact_record(paths.disk, repository_root),
+    }
+    return {
+        "actual_size_bytes": records["qcow2"]["size_bytes"],
+        "format": "qcow2",
+        "integrity_check": integrity or "qemu-img check exited 0",
+        "sidecar_artifacts": {"buildlog": records["buildlog"], "osbuild_manifest": records["osbuild_manifest"]},
+        "virtual_size_bytes": virtual_size,
+    }
+
+
+def _find_serial_line(lines, text, after=0):
+    """Return a one-based log line number containing text after a prior line."""
+
+    for index, line in enumerate(lines, start=1):
+        if index > after and text in line:
+            return index
+    return None
+
+
+def _read_serial_assertions(serial_log, acceleration):
+    """Validate the bounded guest signal sequence from its complete serial log."""
+
+    path = Path(serial_log)
+    if path.is_symlink() or not path.is_file():
+        raise SmokeRunnerError("QEMU did not create a regular serial log")
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as error:
+        raise SmokeRunnerError("could not read serial log: {0}".format(error)) from error
+    marker_lines = [index for index, line in enumerate(lines, start=1) if "AUREON_PHASE0_READY" in line]
+    if len(marker_lines) != 1:
+        raise SmokeRunnerError(
+            "serial log must contain exactly one AUREON_PHASE0_READY marker; observed {0}".format(
+                len(marker_lines)
+            )
+        )
+    ready_line = marker_lines[0]
+    poweroff_line = _find_serial_line(lines, "Powering off", ready_line)
+    final_line = _find_serial_line(lines, "reboot: Power down", ready_line)
+    if poweroff_line is None or final_line is None or final_line <= poweroff_line:
+        raise SmokeRunnerError("serial log does not show clean guest poweroff after readiness")
+    acceleration_line = None
+    if acceleration == "kvm":
+        acceleration_line = _find_serial_line(lines, "kvm: exiting hardware virtualization")
+        if acceleration_line is None:
+            raise SmokeRunnerError("KVM was selected but its serial evidence was not observed")
+    return {
+        "acceleration_evidence_line": acceleration_line,
+        "clean_guest_shutdown_line": final_line,
+        "poweroff_line": poweroff_line,
+        "readiness_line": ready_line,
+        "serial_kernel_arguments_line": _find_serial_line(lines, "console=ttyS0,115200n8"),
+    }
+
+
+def _run_qemu_smoke(argv, serial_log, qemu_log, timeout_seconds, environment):
+    """Run only QEMU in its own process group and poll its serial readiness marker."""
+
+    started = time.monotonic()
+    ready_after_seconds = None
+    timed_out = False
+    try:
+        with Path(qemu_log).open("xb") as log_handle:
+            process = subprocess.Popen(
+                tuple(str(argument) for argument in argv),
+                cwd="/",
+                env=environment,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            while process.poll() is None:
+                if ready_after_seconds is None and Path(serial_log).is_file():
+                    try:
+                        serial_text = Path(serial_log).read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        serial_text = ""
+                    if "AUREON_PHASE0_READY" in serial_text:
+                        ready_after_seconds = round(time.monotonic() - started, 3)
+                if time.monotonic() - started >= timeout_seconds:
+                    timed_out = True
+                    _terminate_process_group(process)
+                    break
+                time.sleep(0.25)
+            returncode = process.wait(timeout=10)
+    except FileExistsError as error:
+        raise SmokeRunnerError("refusing to overwrite QEMU log '{0}'".format(qemu_log)) from error
+    except OSError as error:
+        raise SmokeRunnerError("could not start QEMU: {0}".format(error)) from error
+    return {
+        "qemu_exit_code": returncode,
+        "readiness_after_seconds": ready_after_seconds,
+        "timeout_reached": timed_out,
+        "wall_duration_seconds": round(time.monotonic() - started, 3),
+    }
+
+
+def _write_smoke_result_if_possible(paths, payload):
+    """Preserve a final result when the build root was safely created."""
+
+    try:
+        if paths.build_root.is_dir() and not paths.result.exists():
+            _write_json_once(paths.result, payload)
+    except (OSError, SmokeRunnerError):
+        # The original stage error remains more actionable than a secondary
+        # evidence-write error.  Never attempt an overwrite as recovery.
+        return
+
+
+def execute_smoke_plan(
+    plan,
+    paths,
+    timeout_seconds=SMOKE_TIMEOUT_DEFAULT_SECONDS,
+    acceleration_policy="auto",
+    repository_root=REPOSITORY_ROOT,
+):
+    """Execute the reviewed OCI -> qcow2 -> QEMU chain inside Linux/WSL only."""
+
+    root = Path(repository_root).resolve()
+    if not isinstance(plan, dict) or plan.get("command") != "test-smoke":
+        raise SmokeRunnerError("execute_smoke_plan requires a validated test-smoke plan")
+    try:
+        build_id = validate_build_id(plan.get("build_id"))
+        paths = validate_canonical_smoke_paths(paths, root)
+    except PlanValidationError as error:
+        raise SmokeRunnerError("unsafe smoke execution input: {0}".format(error)) from error
+    if paths.build_root.name != build_id:
+        raise SmokeRunnerError("smoke plan build ID does not match its fixed artifact topology")
+    preflight = collect_smoke_runner_preflight(root, acceleration_policy)
+    environment = _runner_environment()
+    started_at = _utc_timestamp()
+    result_base = {
+        "build_id": plan["build_id"],
+        "command": "test-smoke",
+        "paths": smoke_plan_paths(paths, root),
+        "started_at_utc": started_at,
+    }
+    qemu_started = False
+    try:
+        _create_smoke_artifact_roots(paths, plan, root)
+        _ensure_dedicated_runroot()
+        podman = preflight["executables"]["podman"]
+        qemu = preflight["executables"]["qemu"]
+        qemu_img = preflight["executables"]["qemu_img"]
+        acceleration = preflight["acceleration"]
+        podman_prefix = (
+            podman,
+            "--root",
+            str(PHASE0_PODMAN_STORE),
+            "--runroot",
+            str(PHASE0_PODMAN_RUNROOT),
+        )
+        tag = "localhost/aureon-phase0:{0}".format(plan["build_id"])
+        build_command = podman_prefix + (
+            "build",
+            "--pull=never",
+            "--network=none",
+            "--http-proxy=false",
+            "--no-cache",
+            "--format",
+            "oci",
+            "--file",
+            str(root / "system" / "Containerfile"),
+            "--tag",
+            tag,
+            str(root / "system"),
+        )
+        build_stage = _run_logged_command(
+            build_command, paths.oci_build_log, SMOKE_STAGE_TIMEOUT_SECONDS, environment
+        )
+        derived_digest = _capture_command(
+            podman_prefix + ("image", "inspect", "--format", "{{.Digest}}", tag),
+            60,
+            environment,
+        ).strip()
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", derived_digest):
+            raise SmokeRunnerError("derived OCI image did not expose a sha256 digest")
+        platform_name = _capture_command(
+            podman_prefix + ("image", "inspect", "--format", "{{.Os}}/{{.Architecture}}", tag),
+            60,
+            environment,
+        ).strip()
+        if platform_name != "linux/amd64":
+            raise SmokeRunnerError("derived OCI platform must be linux/amd64; observed '{0}'".format(platform_name))
+        image_id = _capture_command(
+            podman_prefix + ("image", "inspect", "--format", "{{.Id}}", tag),
+            60,
+            environment,
+        ).strip()
+        _, source_digest_after = declared_input_records(root)
+        if source_digest_after != plan["inputs"]["digest"]:
+            raise SmokeRunnerError("declared source inputs changed while the OCI was being built")
+        immutable_local_reference = "localhost/aureon-phase0@{0}".format(derived_digest)
+        _write_json_once(
+            paths.derived_oci,
+            {
+                "build_id": plan["build_id"],
+                "derived_oci": {
+                    "image_id": image_id,
+                    "immutable_local_reference": immutable_local_reference,
+                    "local_tag": tag,
+                    "platform": platform_name,
+                },
+                "inputs": {
+                    "base_image": PHASE0_BASE_REFERENCE,
+                    "image_builder": PHASE0_IMAGE_BUILDER_REFERENCE,
+                    "source_digest": plan["inputs"]["digest"],
+                },
+                "scope": {
+                    "network": "disabled",
+                    "physical_block_devices_accessed": False,
+                    "windows_install_or_boot_changes": False,
+                },
+                "stage": {"oci_build": build_stage},
+                "status": "passed",
+            },
+        )
+
+        installed_storage = PHASE0_PODMAN_CONFIG_DIR / "storage.conf"
+        installed_containers = PHASE0_PODMAN_CONFIG_DIR / "containers.conf"
+        conversion_command = podman_prefix + (
+            "run",
+            "--rm",
+            "--privileged",
+            "--pull=never",
+            "--network=none",
+            "-e",
+            "CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf",
+            "-v",
+            "{0}:/etc/containers/storage.conf:ro".format(installed_storage),
+            "-v",
+            "{0}:/etc/containers/containers.conf:ro".format(installed_containers),
+            "-v",
+            "{0}:{0}:rw".format(PHASE0_PODMAN_STORE),
+            "-v",
+            "{0}:/var/lib/containers/storage:rw".format(PHASE0_PODMAN_STORE),
+            "-v",
+            "{0}:/output:rw".format(paths.image_root),
+            PHASE0_IMAGE_BUILDER_REFERENCE,
+            "--output-dir",
+            "/output",
+            "build",
+            "qcow2",
+            "--bootc-ref",
+            immutable_local_reference,
+            "--bootc-default-fs",
+            "ext4",
+            "--image-size",
+            str(SMOKE_IMAGE_SIZE_BYTES),
+            "--output-name",
+            "aureon-base",
+            "--with-manifest",
+            "--with-buildlog",
+            "--progress",
+            "verbose",
+        )
+        conversion_stage = _run_logged_command(
+            conversion_command, paths.conversion_log, SMOKE_STAGE_TIMEOUT_SECONDS, environment
+        )
+        qcow2_details = _inspect_qcow2(paths, qemu_img, environment, root)
+        _write_json_once(
+            paths.qcow2_evidence,
+            {
+                "build_id": plan["build_id"],
+                "conversion": {
+                    "exit_code": conversion_stage["returncode"],
+                    "image_builder": PHASE0_IMAGE_BUILDER_REFERENCE,
+                    "network": "disabled",
+                    "requested_image_size_bytes": SMOKE_IMAGE_SIZE_BYTES,
+                    "root_filesystem": "ext4",
+                },
+                "path": relative_repository_path(paths.disk, root),
+                "source_oci": immutable_local_reference,
+                "status": "passed",
+                **qcow2_details,
+            },
+        )
+
+        base_hash_before = _sha256_file(paths.disk)
+        shutil.copyfile(PHASE0_OVMF_VARS, paths.vars_copy)
+        overlay_create_log = paths.work_root / "overlay-create.log"
+        _run_logged_command(
+            (qemu_img, "create", "-f", "qcow2", "-F", "qcow2", "-b", str(paths.disk), str(paths.overlay)),
+            overlay_create_log,
+            120,
+            environment,
+        )
+        qemu_command = (
+            qemu,
+            "-machine",
+            "q35,accel={0}".format(acceleration),
+            "-cpu",
+            "max",
+            "-smp",
+            str(SMOKE_VCPUS),
+            "-m",
+            str(SMOKE_MEMORY_MIB),
+            "-nodefaults",
+            "-drive",
+            "if=pflash,format=raw,readonly=on,file={0}".format(PHASE0_OVMF_CODE),
+            "-drive",
+            "if=pflash,format=raw,file={0}".format(paths.vars_copy),
+            "-drive",
+            "if=virtio,format=qcow2,file={0}".format(paths.overlay),
+            "-nic",
+            "none",
+            "-display",
+            "none",
+            "-serial",
+            "file:{0}".format(paths.serial_log),
+            "-monitor",
+            "none",
+            "-no-reboot",
+        )
+        qemu_started = True
+        qemu_result = _run_qemu_smoke(
+            qemu_command, paths.serial_log, paths.qemu_log, timeout_seconds, environment
+        )
+        if qemu_result["timeout_reached"]:
+            raise SmokeRunnerError("QEMU reached the configured boot timeout; only its child process group was stopped")
+        if qemu_result["qemu_exit_code"] != 0:
+            raise SmokeRunnerError(
+                "QEMU exited {0}; inspect '{1}' and '{2}'".format(
+                    qemu_result["qemu_exit_code"], paths.serial_log, paths.qemu_log
+                )
+            )
+        assertions = _read_serial_assertions(paths.serial_log, acceleration)
+        if assertions["serial_kernel_arguments_line"] is None:
+            raise SmokeRunnerError("serial log does not prove the required ttyS0 kernel argument")
+        overlay_integrity = _capture_command((qemu_img, "check", str(paths.overlay)), 120, environment).strip()
+        base_hash_after = _sha256_file(paths.disk)
+        if base_hash_before != base_hash_after:
+            raise SmokeRunnerError("the base qcow2 hash changed during QEMU smoke; refusing to report success")
+        _write_json_once(
+            paths.smoke,
+            {
+                "assertions": assertions,
+                "artifacts": {
+                    "overlay": _artifact_record(paths.overlay, root),
+                    "qemu_log": _artifact_record(paths.qemu_log, root),
+                    "serial_log": _artifact_record(paths.serial_log, root),
+                },
+                "build_id": plan["build_id"],
+                "qemu": {
+                    "acceleration": acceleration,
+                    "arguments": list(qemu_command[1:]),
+                    "base_sha256_before_and_after": base_hash_after,
+                    "base_storage_mode": "copy-on-write backing file; no base writes accepted",
+                    "guest_network": "none",
+                    "host_directories_mounted_in_guest": False,
+                    "memory_mib": SMOKE_MEMORY_MIB,
+                    "overlay_integrity_check": overlay_integrity or "qemu-img check exited 0",
+                    "vcpus": SMOKE_VCPUS,
+                },
+                "qemu_exit_code": qemu_result["qemu_exit_code"],
+                "readiness_after_seconds": qemu_result["readiness_after_seconds"],
+                "scope": {
+                    "physical_block_devices_accessed": False,
+                    "windows_install_or_boot_changes": False,
+                },
+                "status": "passed",
+                "timeout_reached": False,
+                "timeout_seconds": timeout_seconds,
+                "wall_duration_seconds": qemu_result["wall_duration_seconds"],
+            },
+        )
+        completed = dict(result_base)
+        completed.update(
+            {
+                "completed_at_utc": _utc_timestamp(),
+                "qemu_acceleration": acceleration,
+                "qcow2_sha256": base_hash_after,
+                "status": "passed",
+                "wall_duration_seconds": qemu_result["wall_duration_seconds"],
+            }
+        )
+        _write_smoke_result_if_possible(paths, completed)
+        return completed
+    except (OSError, PlanValidationError, SmokeRunnerError) as error:
+        failed = dict(result_base)
+        failed.update({"completed_at_utc": _utc_timestamp(), "error": str(error), "status": "failed"})
+        if qemu_started and paths.work_root.is_dir() and not paths.smoke.exists():
+            try:
+                _write_json_once(
+                    paths.smoke,
+                    {
+                        "build_id": plan["build_id"],
+                        "error": str(error),
+                        "status": "failed",
+                        "timeout_seconds": timeout_seconds,
+                    },
+                )
+            except (OSError, SmokeRunnerError):
+                pass
+        _write_smoke_result_if_possible(paths, failed)
+        raise SmokeRunnerError(str(error)) from error
+
+
+def run_smoke(workspace, build_id, execution_mode, timeout_seconds, acceleration, output):
+    """Print a no-write plan or execute the fixed Phase 0 smoke pipeline."""
+
+    try:
+        inspection_scope = canonical_workspace(workspace)
+        timeout_seconds = validate_smoke_timeout(timeout_seconds)
+        paths = smoke_paths(build_id)
+        plan = create_smoke_plan(build_id, timeout_seconds, acceleration)
+    except WorkspaceScopeError as error:
+        return report_workspace_rejection(error, output)
+    except PlanValidationError as error:
+        return report_plan_rejection(error, output)
+
+    if execution_mode == "dry-run":
+        print(json.dumps(plan, ensure_ascii=True, indent=2, sort_keys=True), file=output)
+        return 0
+
+    if inspection_scope != REPOSITORY_ROOT:
+        print(
+            "{0}: test-smoke --execute requires the checkout root as --workspace; nested scopes are planning-only.".format(
+                PROGRAM_NAME
+            ),
+            file=output,
+        )
+        print("No artifacts, virtual machines, host settings, or disks were modified.", file=output)
+        return UNSAFE_INPUT_EXIT_CODE
+    if build_id == DEFAULT_BUILD_ID:
+        print(
+            "{0}: test-smoke --execute requires an explicit unused --build-id; the default 'dev' is planning-only.".format(
+                PROGRAM_NAME
+            ),
+            file=output,
+        )
+        print("No artifacts, virtual machines, host settings, or disks were modified.", file=output)
+        return UNSAFE_INPUT_EXIT_CODE
+    try:
+        require_unused_smoke_output_roots(paths)
+        result = execute_smoke_plan(plan, paths, timeout_seconds, acceleration)
+    except PlanValidationError as error:
+        return report_plan_rejection(error, output)
+    except SmokeRunnerError as error:
+        print("{0}: test-smoke failed safely: {1}".format(PROGRAM_NAME, error), file=output)
+        print(
+            "Any evidence already created remains under this build ID. No physical disk, Windows boot setting, "
+            "host partition, or guest network was used.",
+            file=output,
+        )
+        return RUNNER_FAILURE_EXIT_CODE
+    print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True), file=output)
+    return 0
+
+
+def first_executable(candidates, which=shutil.which):
+    """Return the first executable found on PATH, without executing it."""
+
+    for candidate in candidates:
+        found = which(candidate)
+        if found is not None:
+            return found
+    return None
+
+
+def executable_check(name, candidates, which):
+    """Create a required presence check using PATH lookups only."""
+
+    found = first_executable(candidates, which)
+    if found is None:
+        return PreflightCheck(name, NOT_FOUND, "not found on PATH")
+    return PreflightCheck(name, FOUND, found)
+
+
+def python_check(version_info=None):
+    """Verify the interpreter that is running this safe preflight."""
+
+    current_version = tuple(version_info or sys.version_info)
+    rendered_version = ".".join(str(part) for part in current_version[:3])
+    if current_version[:2] < MINIMUM_PYTHON_VERSION:
+        return PreflightCheck(
+            "Python >= {0}.{1}".format(*MINIMUM_PYTHON_VERSION),
+            NOT_VERIFIED,
+            "running Python {0}; Phase 0 requires >= {1}.{2}".format(
+                rendered_version, *MINIMUM_PYTHON_VERSION
+            ),
+        )
+    return PreflightCheck(
+        "Python >= {0}.{1}".format(*MINIMUM_PYTHON_VERSION),
+        FOUND,
+        "{0} (Python {1})".format(sys.executable or "unknown executable", rendered_version),
+    )
+
+
+def run_wsl_query(command):
+    """Run a bounded, read-only WSL query and normalize its result."""
+
+    result = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=5,
+    )
+    return WslQueryResult(
+        returncode=result.returncode,
+        stdout=result.stdout or "",
+        stderr=result.stderr or "",
+    )
+
+
+def trusted_windows_wsl_executable(environ=None, path_is_file=None):
+    """Return only the system WSL executable, never a look-alike from PATH."""
+
+    environment = environ if environ is not None else os.environ
+    system_root = environment.get("SystemRoot")
+    if not system_root:
+        return None, "SystemRoot is not set; cannot safely locate System32\\wsl.exe"
+    if is_remote_or_unc_path(system_root):
+        return None, "SystemRoot is UNC or remote; refusing to execute WSL from it"
+    if not re.match(r"^[a-z]:[\\\\/]", os.fspath(system_root), flags=re.IGNORECASE):
+        return None, "SystemRoot is not an absolute local Windows path"
+
+    candidate = Path(system_root) / "System32" / "wsl.exe"
+    is_file = path_is_file if path_is_file is not None else lambda path: path.is_file()
+    try:
+        if not is_file(candidate):
+            return None, "trusted WSL executable was not found at '{0}'".format(candidate)
+    except OSError as error:
+        return None, "could not inspect trusted WSL executable '{0}': {1}".format(candidate, error)
+    return str(candidate), None
+
+
+def linux_builder_check(
+    host_system=None,
+    which=shutil.which,
+    wsl_query=None,
+    environ=None,
+    path_is_file=None,
+):
+    """Check for a usable Linux build environment without changing it."""
+
+    system_name = (host_system or platform.system()).lower()
+    if system_name == "linux":
+        return PreflightCheck("Linux builder", FOUND, "host Linux detected")
+    if system_name != "windows":
+        return PreflightCheck(
+            "Linux builder",
+            NOT_VERIFIED,
+            "unsupported host platform '{0}'; use Linux or a usable WSL installation".format(
+                host_system or platform.system()
+            ),
+        )
+
+    # Windows PATH can contain an attacker-controlled ``wsl.exe``.  ``which``
+    # remains an injected argument for compatibility, but is deliberately not
+    # consulted for this Windows execution boundary.
+    wsl_path, wsl_error = trusted_windows_wsl_executable(environ, path_is_file)
+    if wsl_path is None:
+        return PreflightCheck("Linux builder (WSL)", NOT_VERIFIED, wsl_error)
+
+    query = wsl_query or run_wsl_query
+    try:
+        status_result = query((wsl_path, "--status"))
+        if status_result.returncode != 0:
+            return PreflightCheck(
+                "Linux builder (WSL)",
+                NOT_VERIFIED,
+                "{0} is present but '--status' exited {1}".format(
+                    wsl_path, status_result.returncode
+                ),
+            )
+
+        list_result = query((wsl_path, "--list", "--quiet"))
+        if list_result.returncode != 0:
+            return PreflightCheck(
+                "Linux builder (WSL)",
+                NOT_VERIFIED,
+                "{0} is present but '--list --quiet' exited {1}".format(
+                    wsl_path, list_result.returncode
+                ),
+            )
+    except subprocess.TimeoutExpired:
+        return PreflightCheck(
+            "Linux builder (WSL)", NOT_VERIFIED, "read-only WSL query timed out after 5 seconds"
+        )
+    except OSError as error:
+        return PreflightCheck(
+            "Linux builder (WSL)", NOT_VERIFIED, "could not query WSL: {0}".format(error)
+        )
+
+    distributions = [line.strip() for line in list_result.stdout.splitlines() if line.strip()]
+    if not distributions:
+        return PreflightCheck(
+            "Linux builder (WSL)", NOT_VERIFIED, "WSL is present but no installed distribution was reported"
+        )
+    return PreflightCheck(
+        "Linux builder (WSL)",
+        FOUND,
+        "{0} reported {1} installed distribution(s)".format(wsl_path, len(distributions)),
+    )
+
+
+def validate_wsl_distribution(distribution):
+    """Accept only a literal WSL distribution name, never an option or shell fragment."""
+
+    if not isinstance(distribution, str) or not WSL_DISTRIBUTION_PATTERN.fullmatch(distribution):
+        raise PlanValidationError(
+            "WSL distribution must contain only letters, digits, '.', '_' or '-'"
+        )
+    return distribution
+
+
+def _wsl_guest_query(query, wsl_path, distribution, argv):
+    """Perform one literal, read-only guest command through the trusted WSL binary."""
+
+    return query((wsl_path, "--distribution", distribution, "--exec") + tuple(argv))
+
+
+def collect_wsl_guest_checks(
+    distribution=DEFAULT_WSL_DISTRIBUTION,
+    wsl_query=None,
+    environ=None,
+    path_is_file=None,
+):
+    """Inspect the actual Ubuntu builder tools through read-only WSL commands.
+
+    This is intentionally not a generic guest-command interface: every command
+    below is a literal binary plus read-only version or capability arguments.
+    It never invokes a shell, sudo, Podman run, QEMU, networking, installation,
+    or file creation.
+    """
+
+    try:
+        distribution = validate_wsl_distribution(distribution)
+    except PlanValidationError as error:
+        return (PreflightCheck("Linux builder (WSL)", NOT_VERIFIED, str(error)),)
+    wsl_path, wsl_error = trusted_windows_wsl_executable(environ, path_is_file)
+    if wsl_path is None:
+        return (PreflightCheck("Linux builder (WSL)", NOT_VERIFIED, wsl_error),)
+    query = wsl_query or run_wsl_query
+    try:
+        status_result = query((wsl_path, "--status"))
+        if status_result.returncode != 0:
+            return (
+                PreflightCheck(
+                    "Linux builder (WSL)",
+                    NOT_VERIFIED,
+                    "{0} is present but '--status' exited {1}".format(
+                        wsl_path, status_result.returncode
+                    ),
+                ),
+            )
+        list_result = query((wsl_path, "--list", "--quiet"))
+        if list_result.returncode != 0:
+            return (
+                PreflightCheck(
+                    "Linux builder (WSL)",
+                    NOT_VERIFIED,
+                    "{0} is present but '--list --quiet' exited {1}".format(
+                        wsl_path, list_result.returncode
+                    ),
+                ),
+            )
+    except subprocess.TimeoutExpired:
+        return (
+            PreflightCheck(
+                "Linux builder (WSL)", NOT_VERIFIED, "read-only WSL query timed out after 5 seconds"
+            ),
+        )
+    except OSError as error:
+        return (PreflightCheck("Linux builder (WSL)", NOT_VERIFIED, "could not query WSL: {0}".format(error)),)
+
+    distributions = [line.strip() for line in list_result.stdout.splitlines() if line.strip()]
+    if distribution not in distributions:
+        return (
+            PreflightCheck(
+                "Linux builder (WSL)",
+                NOT_VERIFIED,
+                "required distribution '{0}' is not installed; observed: {1}".format(
+                    distribution, ", ".join(distributions) if distributions else "none"
+                ),
+            ),
+        )
+
+    checks = [
+        PreflightCheck(
+            "Linux builder (WSL)",
+            FOUND,
+            "trusted WSL executable reports required distribution '{0}'".format(distribution),
+        )
+    ]
+
+    def probe(name, argv, required=True, validator=None, failure_detail=None):
+        try:
+            result = _wsl_guest_query(query, wsl_path, distribution, argv)
+        except subprocess.TimeoutExpired:
+            checks.append(
+                PreflightCheck(name, NOT_VERIFIED, "read-only guest probe timed out after 5 seconds", required)
+            )
+            return
+        except OSError as error:
+            checks.append(PreflightCheck(name, NOT_VERIFIED, "could not query guest: {0}".format(error), required))
+            return
+        output = (result.stdout or "").strip()
+        if result.returncode != 0:
+            checks.append(
+                PreflightCheck(
+                    name,
+                    NOT_FOUND,
+                    failure_detail
+                    or "guest command exited {0}: {1}".format(result.returncode, " ".join(argv)),
+                    required,
+                )
+            )
+            return
+        if validator is not None and not validator(output):
+            checks.append(
+                PreflightCheck(
+                    name,
+                    NOT_VERIFIED,
+                    failure_detail or "guest returned unexpected output: '{0}'".format(output),
+                    required,
+                )
+            )
+            return
+        checks.append(PreflightCheck(name, FOUND, output or "available", required))
+
+    probe(
+        "WSL guest architecture",
+        ("/usr/bin/uname", "-m"),
+        validator=lambda output: output == "x86_64",
+        failure_detail="Phase 0 requires a guest reporting x86_64",
+    )
+    probe(
+        "WSL Python >= 3.10",
+        ("/usr/bin/python3", "--version"),
+        validator=lambda output: bool(
+            re.search(r"Python\s+(?:3\.(?:1[0-9]|[2-9][0-9])|[4-9]\.)", output)
+        ),
+        failure_detail="guest Python must be version 3.10 or newer",
+    )
+    probe("WSL Podman", ("/usr/bin/podman", "--version"))
+    probe("WSL QEMU system emulator", ("/usr/bin/qemu-system-x86_64", "--version"))
+    probe("WSL QEMU image tool", ("/usr/bin/qemu-img", "--version"))
+    probe(
+        "WSL OVMF firmware",
+        ("/usr/bin/test", "-r", str(PHASE0_OVMF_CODE), "-a", "-r", str(PHASE0_OVMF_VARS)),
+        failure_detail="required readable OVMF code and variable files were not found",
+    )
+    probe(
+        "WSL KVM acceleration (optional)",
+        ("/usr/bin/test", "-r", "/dev/kvm"),
+        required=False,
+        failure_detail="/dev/kvm is unavailable; functional TCG fallback is expected",
+    )
+    return tuple(checks)
+
+
+def default_ovmf_paths(environ=None, operating_system=None):
+    """Return explicit, read-only OVMF locations; never scan or create paths."""
+
+    environment = environ if environ is not None else os.environ
+    platform_name = operating_system if operating_system is not None else os.name
+    candidates = []
+    configured = environment.get("AUREON_OVMF_CODE")
+    if configured and not is_remote_or_unc_path(configured):
+        candidates.append(Path(configured))
+
+    if platform_name == "nt":
+        program_files = Path(environment.get("ProgramFiles", r"C:\Program Files"))
+        candidates.extend(
+            (
+                program_files / "qemu" / "share" / "edk2-x86_64-code.fd",
+                program_files / "qemu" / "share" / "OVMF_CODE.fd",
+            )
+        )
+    else:
+        candidates.extend(
+            (
+                # Ubuntu 24.04's OVMF package ships the current 4 MiB firmware
+                # under this name rather than the legacy OVMF_CODE.fd name.
+                Path("/usr/share/OVMF/OVMF_CODE_4M.fd"),
+                Path("/usr/share/OVMF/OVMF_CODE.fd"),
+                Path("/usr/share/edk2/ovmf/OVMF_CODE.fd"),
+                Path("/usr/share/edk2-ovmf/x64/OVMF_CODE.fd"),
+                Path("/usr/share/qemu/OVMF_CODE.fd"),
+                Path("/usr/share/ovmf/OVMF.fd"),
+            )
+        )
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        rendered = str(candidate)
+        if rendered not in seen:
+            seen.add(rendered)
+            unique.append(candidate)
+    return tuple(unique)
+
+
+def ovmf_check(paths=None, environ=None):
+    """Check known OVMF firmware locations without creating or scanning files."""
+
+    environment = environ if environ is not None else os.environ
+    configured = environment.get("AUREON_OVMF_CODE")
+    if paths is None and configured and is_remote_or_unc_path(configured):
+        return PreflightCheck(
+            "OVMF firmware",
+            NOT_VERIFIED,
+            "AUREON_OVMF_CODE must be a local filesystem path; UNC and remote paths are rejected",
+        )
+
+    candidates = tuple(paths) if paths is not None else default_ovmf_paths(environment)
+    unsafe_candidates = [candidate for candidate in candidates if is_remote_or_unc_path(candidate)]
+    if unsafe_candidates:
+        return PreflightCheck(
+            "OVMF firmware",
+            NOT_VERIFIED,
+            "UNC and remote firmware paths are rejected: {0}".format(
+                ", ".join(str(candidate) for candidate in unsafe_candidates)
+            ),
+        )
+    errors = []
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return PreflightCheck("OVMF firmware", FOUND, str(candidate))
+        except OSError as error:
+            errors.append("{0}: {1}".format(candidate, error))
+
+    if errors:
+        return PreflightCheck("OVMF firmware", NOT_VERIFIED, "; ".join(errors))
+    return PreflightCheck(
+        "OVMF firmware",
+        NOT_FOUND,
+        "not found in known locations; set AUREON_OVMF_CODE to an existing firmware file",
+    )
+
+
+def container_builder_check(which):
+    """Require at least one OCI builder without running either executable."""
+
+    podman = first_executable(("podman",), which)
+    docker = first_executable(("docker",), which)
+    if podman is None and docker is None:
+        return PreflightCheck(
+            "OCI builder (Podman or Docker)", NOT_FOUND, "neither Podman nor Docker was found on PATH"
+        )
+
+    available = []
+    if podman is not None:
+        available.append("Podman: {0}".format(podman))
+    if docker is not None:
+        available.append("Docker: {0}".format(docker))
+    return PreflightCheck("OCI builder (Podman or Docker)", FOUND, "; ".join(available))
+
+
+def collect_preflight_checks(
+    host_system=None,
+    which=shutil.which,
+    version_info=None,
+    ovmf_paths=None,
+    wsl_query=None,
+    wsl_distribution=DEFAULT_WSL_DISTRIBUTION,
+    environ=None,
+    path_is_file=None,
+):
+    """Collect every required Phase 0 preflight condition without mutations."""
+
+    system_name = (host_system or platform.system()).lower()
+    basic_checks = (
+        python_check(version_info),
+        executable_check("Git", ("git",), which),
+    )
+    if system_name == "windows":
+        # The actual Phase 0 toolchain lives in WSL.  Do not produce a false
+        # positive merely because unrelated host binaries happen to be on PATH.
+        return basic_checks + collect_wsl_guest_checks(
+            distribution=wsl_distribution,
+            wsl_query=wsl_query,
+            environ=environ,
+            path_is_file=path_is_file,
+        )
+    return basic_checks + (
+        linux_builder_check(host_system, which, wsl_query, environ, path_is_file),
+        executable_check("QEMU system emulator", ("qemu-system-x86_64",), which),
+        executable_check("QEMU image tool", ("qemu-img",), which),
+        container_builder_check(which),
+        ovmf_check(ovmf_paths),
+    )
+
+
+def expected_paths(repository_root):
+    """Return Phase 0 artifact paths only; this function never creates them."""
+
+    return (
+        ("Build artifacts", repository_root / "build"),
+        ("Bootable images", repository_root / "images"),
+        ("QEMU work directory", repository_root / "work" / "qemu"),
+    )
+
+
+def readiness(checks):
+    """Return true only when every required preflight check is found."""
+
+    return all(check.state == FOUND for check in checks if check.required)
+
+
+def report_workspace_rejection(error, output):
+    """Report an invalid workspace without attempting any operation."""
+
+    print("{0}: rejected --workspace: {1}".format(PROGRAM_NAME, error), file=output)
+    print("No files, images, snapshots, virtual machines, host settings, or disks were modified.", file=output)
+    return WORKSPACE_REJECTED_EXIT_CODE
+
+
+def run_doctor(workspace, output, checks=None):
+    """Run the read-only Phase 0 preflight and report honest readiness."""
+
+    try:
+        inspection_scope = canonical_workspace(workspace)
+    except WorkspaceScopeError as error:
+        return report_workspace_rejection(error, output)
+
+    preflight_checks = tuple(checks) if checks is not None else collect_preflight_checks()
+    ready = readiness(preflight_checks)
+
+    print("Aureon OS Phase 0 environment preflight", file=output)
+    print("Mode: read-only; no packages, files, images, VMs, or disks were changed.", file=output)
+    print("Canonical checkout: {0}".format(REPOSITORY_ROOT), file=output)
+    print("Inspection scope: {0}".format(inspection_scope), file=output)
+    print("", file=output)
+    print("Phase 0 artifact paths (reported only):", file=output)
+    for label, path in expected_paths(REPOSITORY_ROOT):
+        state = "present" if path.exists() else "missing"
+        print("  - {0}: {1} ({2})".format(label, path, state), file=output)
+
+    print("", file=output)
+    print("Required capabilities:", file=output)
+    for check in preflight_checks:
+        print("  - [{0}] {1}: {2}".format(check.state, check.name, check.detail), file=output)
+
+    print("", file=output)
+    if ready:
+        print("Readiness: READY", file=output)
+        print("Doctor completed without modifying the host or workspace.", file=output)
+        return 0
+
+    blocked = [check.name for check in preflight_checks if check.required and check.state != FOUND]
+    print("Readiness: NOT READY", file=output)
+    print("Missing or unverified: {0}".format(", ".join(blocked)), file=output)
+    print("Doctor completed without modifying the host or workspace.", file=output)
+    return PREFLIGHT_NOT_READY_EXIT_CODE
+
+
+def run_pending(command, output):
+    """Fail closed for a command whose implementation does not exist yet."""
+
+    contract = PENDING_COMMANDS[command]
+    print("{0}: '{1}' is not implemented yet.".format(PROGRAM_NAME, command), file=output)
+    print("Its implementation is reserved for a later phase after safety checks exist.", file=output)
+    print("Reserved contract: {0}".format(contract), file=output)
+    print(
+        "No files, images, snapshots, virtual machines, host settings, or disks were modified.",
+        file=output,
+    )
+    return NOT_IMPLEMENTED_EXIT_CODE
+
+
+def main(argv=None, stdout=None):
+    """Run the CLI and return an explicit process status code."""
+
+    args = build_parser().parse_args(argv)
+    output = stdout if stdout is not None else sys.stdout
+
+    if args.command == "doctor":
+        return run_doctor(args.workspace, output)
+    if args.command in {"build", "image"}:
+        return run_plan(
+            args.command,
+            args.workspace,
+            args.build_id,
+            args.manifest,
+            getattr(args, "disk", None),
+            args.execution_mode,
+            output,
+        )
+    if args.command == "test-smoke":
+        return run_smoke(
+            args.workspace,
+            args.build_id,
+            args.execution_mode,
+            args.timeout_seconds,
+            args.accel,
+            output,
+        )
+    if args.command in PENDING_COMMANDS:
+        try:
+            canonical_workspace(args.workspace)
+        except WorkspaceScopeError as error:
+            return report_workspace_rejection(error, output)
+        return run_pending(args.command, output)
+
+    # argparse permits no subcommand; show safe guidance rather than guessing.
+    print("{0}: choose 'doctor' or a documented reserved command; use --help.".format(PROGRAM_NAME), file=output)
+    return NOT_IMPLEMENTED_EXIT_CODE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

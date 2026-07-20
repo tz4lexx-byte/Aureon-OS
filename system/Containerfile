@@ -1,0 +1,31 @@
+# Aureon OS — plantilla Fedora bootc de Fase 0.
+#
+# Fase 0 experimental: referencia Fedora bootc x86_64 fijada por digest.
+# Debe mantenerse idéntica a packaging/phase0-image-manifest.template.yaml.
+# No use tags mutables ni ARG para sustituirla durante el build.
+FROM quay.io/fedora/fedora-bootc@sha256:86cd97f1e7962e30f52f35ae1c0719299df4f681492b133ea4bcdb74d154fb92
+
+LABEL org.opencontainers.image.title="Aureon OS Phase 0"
+LABEL org.opencontainers.image.description="Minimal VM-only Fedora bootc derivation; experimental build requires explicit approval."
+LABEL org.opencontainers.image.vendor="Aureon OS"
+
+# This overlay has no users, passwords, SSH keys, network configuration, package
+# installation, or host-mount instructions.
+COPY overlays/ /
+
+# Files copied from a Windows-backed workspace can arrive with permissive mode
+# bits under WSL. Set guest-side permissions explicitly; never inherit host
+# filesystem policy into the image.
+#
+# Enable only the bounded readiness marker for the future serial smoke test.
+# This affects the guest image, never the builder host.
+RUN chmod 0755 /usr/lib/aureon /usr/lib/bootc /usr/lib/bootc/kargs.d && \
+    chmod 0644 /usr/lib/aureon/phase0-release \
+      /usr/lib/bootc/kargs.d/20-aureon-phase0-serial.toml \
+      /usr/lib/systemd/system/aureon-phase0-ready.service \
+      /usr/lib/systemd/system/aureon-phase0-shutdown.service && \
+    install -d -m 0755 /usr/lib/systemd/system/multi-user.target.wants && \
+    ln -s ../aureon-phase0-ready.service \
+      /usr/lib/systemd/system/multi-user.target.wants/aureon-phase0-ready.service && \
+    ln -s ../aureon-phase0-shutdown.service \
+      /usr/lib/systemd/system/multi-user.target.wants/aureon-phase0-shutdown.service

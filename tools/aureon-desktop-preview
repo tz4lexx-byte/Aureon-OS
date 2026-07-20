@@ -1,0 +1,1049 @@
+#!/usr/bin/env python3
+"""Build and display the isolated Aureon KDE desktop preview.
+
+This developer tool is deliberately separate from ``aureon-dev test-smoke``.
+It creates a new bootable *virtual* disk and a new copy-on-write QEMU overlay,
+then opens that overlay in a GTK window through WSLg.  It never accepts a host
+disk, shares a host directory with the guest, creates a guest NIC, installs
+anything into Windows, or changes the Windows boot configuration.
+
+The first build downloads the explicitly listed Fedora desktop packages into
+the dedicated WSL Podman store.  That is why execution requires both
+``--execute`` and ``--allow-build-network``.  Conversion and the guest itself
+run with networking disabled.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+
+PROGRAM = "aureon-desktop-preview"
+ROOT = Path(__file__).resolve().parent.parent
+BUILD_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,62}")
+BASE_REFERENCE = (
+    "quay.io/fedora/fedora-bootc@sha256:"
+    "86cd97f1e7962e30f52f35ae1c0719299df4f681492b133ea4bcdb74d154fb92"
+)
+IMAGE_BUILDER_REFERENCE = (
+    "ghcr.io/osbuild/image-builder-cli@sha256:"
+    "700368cfa3e78b25fb4fe02a87cedf1a5bc0cb142d7287c8c6fff72fd09228f5"
+)
+PODMAN_ROOT = Path("/var/lib/aureon-phase0-podman")
+PODMAN_STORE = PODMAN_ROOT / "storage"
+PODMAN_CONFIG = PODMAN_ROOT / "config"
+PODMAN_RUNROOT = Path("/run/aureon-phase0-podman")
+OVMF_CODE = Path("/usr/share/OVMF/OVMF_CODE_4M.fd")
+OVMF_VARS = Path("/usr/share/OVMF/OVMF_VARS_4M.fd")
+DESKTOP_IMAGE_SIZE_BYTES = 24 * 1024 * 1024 * 1024
+MINIMUM_FREE_BYTES = 35 * 1024 * 1024 * 1024
+DEFAULT_BOOT_TIMEOUT = 900
+MINIMUM_BOOT_TIMEOUT = 60
+MAXIMUM_BOOT_TIMEOUT = 1800
+DEFAULT_MEMORY_MIB = 6144
+DEFAULT_VCPUS = 4
+CONVERSION_TIMEOUT = 5400
+
+
+class PreviewError(RuntimeError):
+    """Raised for a controlled desktop-preview rejection or failed stage."""
+
+
+@dataclass(frozen=True)
+class PreviewPaths:
+    """Fixed, checkout-local output paths for one desktop preview run."""
+
+    build_root: Path
+    image_root: Path
+    work_root: Path
+    manifest: Path
+    result: Path
+    oci_log: Path
+    conversion_log: Path
+    conversion_cid: Path
+    conversion_cleanup_log: Path
+    oci_evidence: Path
+    qcow2_evidence: Path
+    disk: Path
+    buildlog: Path
+    osbuild_manifest: Path
+    vars_copy: Path
+    overlay: Path
+    overlay_log: Path
+    serial_log: Path
+    qemu_log: Path
+    preview_evidence: Path
+
+
+def validate_build_id(value: str) -> str:
+    """Accept only a portable, non-path desktop preview identifier."""
+
+    if not isinstance(value, str) or not BUILD_ID_PATTERN.fullmatch(value) or ".." in value:
+        raise PreviewError("--build-id must use 1-63 lowercase letters, digits, '.', '_' or '-'")
+    if value.endswith((".", " ")):
+        raise PreviewError("--build-id must not end in '.' or space")
+    if value.split(".", 1)[0].casefold() in {"con", "nul", "aux", "prn"}:
+        raise PreviewError("--build-id must not be a Windows device name")
+    return value
+
+
+def _first_link(path: Path, root: Path) -> Path | None:
+    """Return a lexical in-tree symlink instead of following it silently."""
+
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError as error:
+        raise PreviewError("desktop artifacts must stay under the checkout") from error
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            return current
+    return None
+
+
+def _require_inside(candidate: Path, root: Path, label: str) -> Path:
+    """Require a lexical output path to be real and confined to the checkout."""
+
+    lexical = Path(os.path.abspath(os.fspath(candidate)))
+    try:
+        lexical.relative_to(root)
+    except ValueError as error:
+        raise PreviewError("{0} is outside the checkout: {1}".format(label, candidate)) from error
+    link = _first_link(lexical, root)
+    if link is not None:
+        raise PreviewError("{0} traverses symlink '{1}'".format(label, link))
+    return lexical
+
+
+def preview_paths(build_id: str, repository_root: Path = ROOT) -> PreviewPaths:
+    """Return the only locations this tool will ever create or open for write."""
+
+    build_id = validate_build_id(build_id)
+    root = Path(repository_root).resolve()
+    build_root = root / "build" / ("desktop-" + build_id)
+    image_root = root / "images" / ("desktop-" + build_id)
+    work_root = root / "work" / "qemu-desktop" / build_id
+    result = PreviewPaths(
+        build_root=build_root,
+        image_root=image_root,
+        work_root=work_root,
+        manifest=build_root / "manifest.json",
+        result=build_root / "result.json",
+        oci_log=build_root / "oci-build.log",
+        conversion_log=build_root / "conversion.log",
+        conversion_cid=build_root / "conversion.cid",
+        conversion_cleanup_log=build_root / "conversion-cleanup.log",
+        oci_evidence=build_root / "desktop-oci.json",
+        qcow2_evidence=build_root / "qcow2.json",
+        disk=image_root / "aureon-desktop.qcow2",
+        buildlog=image_root / "aureon-desktop.buildlog",
+        osbuild_manifest=image_root / "aureon-desktop.osbuild-manifest.json",
+        vars_copy=work_root / "OVMF_VARS_4M.fd",
+        overlay=work_root / "desktop-overlay.qcow2",
+        overlay_log=work_root / "overlay-create.log",
+        serial_log=work_root / "serial.log",
+        qemu_log=work_root / "qemu.log",
+        preview_evidence=work_root / "preview.json",
+    )
+    for label, candidate in (
+        ("desktop build root", result.build_root),
+        ("desktop image root", result.image_root),
+        ("desktop work root", result.work_root),
+        ("desktop qcow2", result.disk),
+    ):
+        _require_inside(candidate, root, label)
+    return result
+
+
+def _relative(path: Path, root: Path) -> str:
+    """Render only stable, repository-relative evidence paths."""
+
+    return _require_inside(path, root, "evidence path").relative_to(root).as_posix()
+
+
+def _hash_file(path: Path) -> str:
+    """Hash one ordinary file without following an output symlink."""
+
+    if path.is_symlink() or not path.is_file():
+        raise PreviewError("expected a regular non-link file: '{0}'".format(path))
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_digest(root: Path) -> tuple[list[dict[str, str]], str]:
+    """Hash exactly the desktop definition and this launcher for provenance."""
+
+    sources = (root / "system" / "desktop", root / "tools" / PROGRAM)
+    records: list[dict[str, str]] = []
+    for source in sources:
+        lexical = _require_inside(source, root, "desktop source")
+        link = _first_link(lexical, root)
+        if link is not None:
+            raise PreviewError("desktop source traverses symlink '{0}'".format(link))
+        if lexical.is_file():
+            files = (lexical,)
+        elif lexical.is_dir():
+            files = tuple(sorted((item for item in lexical.rglob("*") if item.is_file()), key=str))
+        else:
+            raise PreviewError("desktop source is missing: '{0}'".format(lexical))
+        for item in files:
+            item = _require_inside(item, root, "desktop source")
+            if item.is_symlink() or not item.is_file():
+                raise PreviewError("desktop source must be a regular file: '{0}'".format(item))
+            records.append({"path": item.relative_to(root).as_posix(), "sha256": _hash_file(item)})
+    records.sort(key=lambda record: record["path"])
+    encoded = json.dumps(records, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
+    return records, hashlib.sha256(encoded).hexdigest()
+
+
+def create_plan(build_id: str, boot_timeout: int, acceleration: str, repository_root: Path = ROOT) -> dict:
+    """Create the deterministic no-write preview plan shown by default."""
+
+    if acceleration not in {"auto", "kvm", "tcg"}:
+        raise PreviewError("--accel must be auto, kvm, or tcg")
+    if not MINIMUM_BOOT_TIMEOUT <= boot_timeout <= MAXIMUM_BOOT_TIMEOUT:
+        raise PreviewError(
+            "--boot-timeout-seconds must be between {0} and {1}".format(
+                MINIMUM_BOOT_TIMEOUT, MAXIMUM_BOOT_TIMEOUT
+            )
+        )
+    root = Path(repository_root).resolve()
+    paths = preview_paths(build_id, root)
+    records, digest = _source_digest(root)
+    return {
+        "schema": "aureon.desktop-preview-plan",
+        "version": 1,
+        "command": "desktop-preview",
+        "build_id": build_id,
+        "inputs": {
+            "base_image": BASE_REFERENCE,
+            "image_builder": IMAGE_BUILDER_REFERENCE,
+            "source_algorithm": "sha256",
+            "source_digest": digest,
+            "source_files": records,
+        },
+        "execution": {
+            "mode": "dry-run",
+            "allow_build_network_required": True,
+            "guest_network": "disabled",
+            "boot_timeout_seconds": boot_timeout,
+            "acceleration_policy": acceleration,
+            "memory_mib": DEFAULT_MEMORY_MIB,
+            "vcpus": DEFAULT_VCPUS,
+            "virtual_disk_size_bytes": DESKTOP_IMAGE_SIZE_BYTES,
+        },
+        "safety": {
+            "host_disk_paths_accepted": False,
+            "host_directories_shared_with_guest": False,
+            "physical_usb_passthrough": False,
+            "windows_install_or_boot_changes": False,
+        },
+        "paths": {
+            "manifest": _relative(paths.manifest, root),
+            "result": _relative(paths.result, root),
+            "base_qcow2": _relative(paths.disk, root),
+            "overlay": _relative(paths.overlay, root),
+            "serial_log": _relative(paths.serial_log, root),
+            "qemu_log": _relative(paths.qemu_log, root),
+            "preview_evidence": _relative(paths.preview_evidence, root),
+        },
+    }
+
+
+def _write_json_once(path: Path, payload: dict) -> None:
+    """Preserve evidence and never overwrite a prior run."""
+
+    try:
+        with path.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=True, indent=2, sort_keys=True)
+            handle.write("\n")
+    except FileExistsError as error:
+        raise PreviewError("refusing to overwrite evidence '{0}'".format(path)) from error
+
+
+def _environment() -> dict[str, str]:
+    """Use a minimal process environment for Podman and image tools."""
+
+    return {"HOME": "/root", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
+
+
+def _trusted_executable(path: str, label: str) -> str:
+    """Accept a system executable only, never a checkout or Windows-mounted file."""
+
+    candidate = Path(path)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise PreviewError("{0} is unavailable: {1}".format(label, error)) from error
+    if str(resolved).startswith("/mnt/") or ROOT == resolved or ROOT in resolved.parents:
+        raise PreviewError("{0} must not be loaded from the checkout or a Windows mount".format(label))
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise PreviewError("{0} is not an executable regular file".format(label))
+    return str(resolved)
+
+
+def _capture(argv: tuple[str, ...], environment: dict[str, str], timeout: int = 60) -> str:
+    """Run a reviewed argv-only command and return standard output."""
+
+    try:
+        result = subprocess.run(
+            argv,
+            cwd="/",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PreviewError("could not complete {0}: {1}".format(argv[0], error)) from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().replace("\n", " ")
+        raise PreviewError("command failed ({0}): {1}".format(result.returncode, detail[:240]))
+    return result.stdout or ""
+
+
+def _terminate_group(process: subprocess.Popen) -> None:
+    """Stop only the child process group started by this launcher."""
+
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=15)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=15)
+    except subprocess.TimeoutExpired as error:
+        raise PreviewError("could not stop the launcher-owned process group") from error
+
+
+def _run_logged(
+    argv: tuple[str, ...],
+    log_path: Path,
+    environment: dict[str, str],
+    timeout: int | None,
+    preexec_fn=None,
+) -> dict:
+    """Run one command without a shell while keeping a new combined log."""
+
+    started = time.monotonic()
+    try:
+        with log_path.open("xb") as handle:
+            process = subprocess.Popen(
+                argv,
+                cwd="/",
+                env=environment,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                preexec_fn=preexec_fn,
+            )
+            try:
+                returncode = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                _terminate_group(process)
+                raise PreviewError("command timed out: {0}".format(argv[0])) from error
+    except FileExistsError as error:
+        raise PreviewError("refusing to overwrite log '{0}'".format(log_path)) from error
+    except OSError as error:
+        raise PreviewError("could not start {0}: {1}".format(argv[0], error)) from error
+    if returncode != 0:
+        raise PreviewError("command exited {0}; inspect '{1}'".format(returncode, log_path))
+    return {"returncode": returncode, "duration_seconds": round(time.monotonic() - started, 3)}
+
+
+def _require_real_system_path(path: Path, label: str, directory: bool) -> None:
+    """Reject symlinked, unsafe, or unexpected privileged WSL dependencies."""
+
+    if not path.is_absolute():
+        raise PreviewError("{0} must be an absolute WSL path".format(label))
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError as error:
+            raise PreviewError("{0} is missing: '{1}'".format(label, current)) from error
+        if stat.S_ISLNK(mode):
+            raise PreviewError("{0} must not traverse symlink '{1}'".format(label, current))
+    info = path.stat()
+    if directory and not stat.S_ISDIR(info.st_mode):
+        raise PreviewError("{0} is not a directory".format(label))
+    if not directory and not stat.S_ISREG(info.st_mode):
+        raise PreviewError("{0} is not a regular file".format(label))
+    if info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PreviewError("{0} must be root-owned and not group/world writable".format(label))
+
+
+def _preview_identity() -> tuple[int, int, str, str, tuple[int, ...]]:
+    """Return the unprivileged WSL identity that will own the visible QEMU."""
+
+    try:
+        import pwd
+
+        uid = int(os.environ["SUDO_UID"])
+        gid = int(os.environ["SUDO_GID"])
+        user = os.environ["SUDO_USER"]
+        entry = pwd.getpwnam(user)
+    except (ImportError, KeyError, ValueError, KeyError) as error:
+        raise PreviewError(
+            "run --execute through 'sudo -E' from your normal WSL user so the visible QEMU window is not root-owned"
+        ) from error
+    if uid <= 0 or gid < 0 or entry.pw_uid != uid:
+        raise PreviewError("could not validate the invoking unprivileged WSL user")
+    groups = tuple(sorted(set(os.getgrouplist(user, gid))))
+    return uid, gid, user, entry.pw_dir, groups
+
+
+def _ensure_dedicated_runroot() -> None:
+    """Create only the documented ephemeral Podman runroot after a WSL reboot."""
+
+    if PODMAN_RUNROOT.exists():
+        _require_real_system_path(PODMAN_RUNROOT, "dedicated Podman runroot", True)
+        return
+    _require_real_system_path(PODMAN_RUNROOT.parent, "WSL runtime directory", True)
+    try:
+        PODMAN_RUNROOT.mkdir(mode=0o700)
+    except OSError as error:
+        raise PreviewError("could not create the dedicated WSL Podman runroot: {0}".format(error)) from error
+    _require_real_system_path(PODMAN_RUNROOT, "dedicated Podman runroot", True)
+
+
+def _gui_environment(home: str) -> dict[str, str]:
+    """Pass only WSLg display variables to the unprivileged QEMU frontend."""
+
+    required = ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XAUTHORITY")
+    supplied = {key: os.environ[key] for key in required if os.environ.get(key)}
+    if not supplied.get("DISPLAY") and not supplied.get("WAYLAND_DISPLAY"):
+        raise PreviewError("WSLg display variables are unavailable; run this from your normal Ubuntu WSL session")
+    environment = {"HOME": home, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"}
+    environment.update(supplied)
+    return environment
+
+
+def _qemu_preexec(uid: int, gid: int, groups: tuple[int, ...]):
+    """Create a child-only privilege drop for QEMU's GTK window."""
+
+    def drop_privileges() -> None:
+        os.setgroups(list(groups))
+        os.setgid(gid)
+        os.setuid(uid)
+
+    return drop_privileges
+
+
+def _validate_preflight(root: Path, acceleration: str) -> dict:
+    """Inspect all execution prerequisites before creating preview artifacts."""
+
+    if platform.system().lower() != "linux":
+        raise PreviewError("desktop preview executes only inside Ubuntu WSL, never directly from Windows")
+    if "microsoft" not in Path("/proc/sys/kernel/osrelease").read_text(encoding="utf-8", errors="ignore").lower():
+        raise PreviewError("desktop preview is restricted to WSL so it cannot run against a native Linux host disk")
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None or geteuid() != 0:
+        raise PreviewError("desktop preview requires root inside WSL only; it never elevates Windows")
+    if root.is_symlink() or not root.is_dir():
+        raise PreviewError("checkout root must be a real directory")
+    if shutil.disk_usage(root).free < MINIMUM_FREE_BYTES:
+        raise PreviewError("at least 35 GiB free space is required; the tool will not delete old artifacts automatically")
+    for path, label, directory in (
+        (PODMAN_ROOT, "dedicated Podman root", True),
+        (PODMAN_STORE, "dedicated Podman store", True),
+        (PODMAN_CONFIG, "dedicated Podman configuration", True),
+        (OVMF_CODE, "OVMF code", False),
+        (OVMF_VARS, "OVMF variables", False),
+    ):
+        _require_real_system_path(path, label, directory)
+    _ensure_dedicated_runroot()
+    source_storage = root / "packaging" / "phase0-container-storage.conf"
+    source_containers = root / "packaging" / "phase0-containers.conf"
+    if _hash_file(source_storage) != _hash_file(PODMAN_CONFIG / "storage.conf"):
+        raise PreviewError("the dedicated WSL Podman storage.conf does not match the reviewed project file")
+    if _hash_file(source_containers) != _hash_file(PODMAN_CONFIG / "containers.conf"):
+        raise PreviewError("the dedicated WSL Podman containers.conf does not match the reviewed project file")
+    executables = {
+        "podman": _trusted_executable("/usr/bin/podman", "Podman"),
+        "qemu": _trusted_executable("/usr/bin/qemu-system-x86_64", "QEMU"),
+        "qemu_img": _trusted_executable("/usr/bin/qemu-img", "qemu-img"),
+    }
+    environment = _environment()
+    podman_prefix = (executables["podman"], "--root", str(PODMAN_STORE), "--runroot", str(PODMAN_RUNROOT), "--storage-driver", "overlay")
+    for reference, label in ((BASE_REFERENCE, "Fedora bootc base"), (IMAGE_BUILDER_REFERENCE, "Image Builder")):
+        try:
+            _capture(podman_prefix + ("image", "exists", reference), environment, 30)
+        except PreviewError as error:
+            raise PreviewError("required local {0} is absent from the dedicated WSL store: {1}".format(label, error)) from error
+    displays = _capture((executables["qemu"], "-display", "help"), environment, 30)
+    if "gtk" not in displays.split():
+        raise PreviewError("QEMU GTK display backend is missing; install qemu-system-gui inside Ubuntu WSL")
+    kvm_available = Path("/dev/kvm").exists() and os.access("/dev/kvm", os.R_OK | os.W_OK)
+    if acceleration == "kvm" and not kvm_available:
+        raise PreviewError("KVM was requested but /dev/kvm is unavailable")
+    selected_acceleration = "kvm" if acceleration == "kvm" or (acceleration == "auto" and kvm_available) else "tcg"
+    identity = _preview_identity()
+    gui_environment = _gui_environment(identity[3])
+    return {
+        "executables": executables,
+        "podman_prefix": podman_prefix,
+        "environment": environment,
+        "gui_environment": gui_environment,
+        "identity": identity,
+        "acceleration": selected_acceleration,
+        "kvm_available": kvm_available,
+    }
+
+
+def _require_unused_roots(paths: PreviewPaths, root: Path) -> None:
+    """Refuse prior IDs and unsafe parents instead of overwriting or cleaning."""
+
+    for parent in (root / "build", root / "images"):
+        _require_inside(parent, root, "desktop output parent")
+        if not parent.is_dir() or parent.is_symlink():
+            raise PreviewError("required output parent is missing or unsafe: '{0}'".format(parent))
+    for parent in (root / "work", root / "work" / "qemu-desktop"):
+        _require_inside(parent, root, "desktop work parent")
+        if parent.exists() and (parent.is_symlink() or not parent.is_dir()):
+            raise PreviewError("desktop work parent is unsafe: '{0}'".format(parent))
+    for target in (paths.build_root, paths.image_root, paths.work_root):
+        if target.exists() or target.is_symlink():
+            raise PreviewError("refusing to overwrite existing desktop preview artifact root '{0}'".format(target))
+
+
+def _create_roots(paths: PreviewPaths, plan: dict, root: Path) -> None:
+    """Create just the approved new artifact roots and execution manifest."""
+
+    _require_unused_roots(paths, root)
+    try:
+        (root / "work").mkdir(mode=0o700, exist_ok=True)
+        (root / "work" / "qemu-desktop").mkdir(mode=0o700, exist_ok=True)
+        for target in (paths.build_root, paths.image_root, paths.work_root):
+            target.mkdir(mode=0o700)
+        manifest = dict(plan)
+        manifest["execution"] = dict(plan["execution"])
+        manifest["execution"]["mode"] = "execute"
+        _write_json_once(paths.manifest, manifest)
+    except OSError as error:
+        raise PreviewError("could not create the new desktop preview artifact roots: {0}".format(error)) from error
+
+
+def _expected_converter_outputs(paths: PreviewPaths) -> None:
+    """Reject surprise converter files before QEMU sees any qcow2."""
+
+    expected = {paths.disk.name, paths.buildlog.name, paths.osbuild_manifest.name}
+    observed = {entry.name for entry in paths.image_root.iterdir()}
+    if observed != expected:
+        raise PreviewError("converter output differs from expected files: {0}".format(sorted(observed)))
+    for candidate in (paths.disk, paths.buildlog, paths.osbuild_manifest):
+        if candidate.is_symlink() or not candidate.is_file():
+            raise PreviewError("converter output is not a regular file: '{0}'".format(candidate))
+
+
+def _inspect_qcow2(paths: PreviewPaths, qemu_img: str, environment: dict[str, str], root: Path) -> dict:
+    """Prove the base disk is qcow2 and has no external backing reference."""
+
+    _expected_converter_outputs(paths)
+    try:
+        details = json.loads(_capture((qemu_img, "info", "--output=json", str(paths.disk)), environment, 60))
+    except json.JSONDecodeError as error:
+        raise PreviewError("qemu-img returned invalid JSON") from error
+    if details.get("format") != "qcow2":
+        raise PreviewError("desktop converter did not produce qcow2")
+    if details.get("backing-filename") or details.get("full-backing-filename"):
+        raise PreviewError("base qcow2 must not reference an external backing file")
+    virtual_size = details.get("virtual-size")
+    if not isinstance(virtual_size, int) or virtual_size < 8 * 1024**3 or virtual_size > 32 * 1024**3:
+        raise PreviewError("desktop qcow2 has an unexpected virtual size")
+    integrity = _capture((qemu_img, "check", str(paths.disk)), environment, 180).strip()
+    return {
+        "format": "qcow2",
+        "virtual_size_bytes": virtual_size,
+        "integrity_check": integrity or "qemu-img check exited 0",
+        "sha256": _hash_file(paths.disk),
+    }
+
+
+def _copy_file_exclusive(source: Path, destination: Path) -> None:
+    """Create a private writable OVMF variables copy without following a link."""
+
+    if source.is_symlink() or not source.is_file():
+        raise PreviewError("OVMF variables source is not a regular file")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(destination, flags, 0o600)
+    except FileExistsError as error:
+        raise PreviewError("refusing to overwrite OVMF variables copy") from error
+    try:
+        with source.open("rb") as input_handle, os.fdopen(descriptor, "wb") as output_handle:
+            shutil.copyfileobj(input_handle, output_handle, 1024 * 1024)
+    except OSError as error:
+        raise PreviewError("could not create OVMF variables copy: {0}".format(error)) from error
+    if destination.is_symlink() or not destination.is_file():
+        raise PreviewError("OVMF variables copy became unsafe")
+
+
+def _transfer_work_to_user(paths: PreviewPaths, uid: int, gid: int) -> None:
+    """Let only the invoking WSL user own QEMU's disposable GUI files."""
+
+    for candidate, mode in ((paths.work_root, 0o700), (paths.vars_copy, 0o600), (paths.overlay, 0o600)):
+        if candidate.is_symlink():
+            raise PreviewError("desktop work artifact became a symlink: '{0}'".format(candidate))
+        try:
+            os.chown(candidate, uid, gid)
+            os.chmod(candidate, mode)
+        except OSError as error:
+            raise PreviewError("could not transfer disposable QEMU artifact to the WSL user: {0}".format(error)) from error
+
+
+def _make_base_readonly_for_preview(paths: PreviewPaths) -> None:
+    """Allow QEMU's user to read, but never write, the root-owned base qcow2."""
+
+    for candidate, mode in (
+        (paths.image_root, 0o755),
+        (paths.disk, 0o444),
+        (paths.buildlog, 0o444),
+        (paths.osbuild_manifest, 0o444),
+    ):
+        if candidate.is_symlink():
+            raise PreviewError("desktop base artifact became a symlink: '{0}'".format(candidate))
+        try:
+            os.chmod(candidate, mode)
+        except OSError as error:
+            raise PreviewError("could not make desktop base artifact read-only: {0}".format(error)) from error
+
+
+def _cleanup_conversion(
+    podman_prefix: tuple[str, ...], cid_path: Path, cleanup_log: Path, build_id: str, environment: dict[str, str]
+) -> None:
+    """Stop/remove only the converter whose CID file and label prove ownership."""
+
+    try:
+        with cleanup_log.open("x", encoding="utf-8", newline="\n") as log:
+            if cid_path.is_symlink() or not cid_path.is_file():
+                log.write("No owned converter CID was created; no cleanup target was selected.\n")
+                return
+            cid = cid_path.read_text(encoding="ascii", errors="ignore").strip()
+            if not re.fullmatch(r"[0-9a-f]{12,64}", cid):
+                log.write("Refused cleanup: CID file was malformed.\n")
+                return
+            inspect = subprocess.run(
+                podman_prefix + ("container", "inspect", "--format", "{{index .Config.Labels \"io.aureon.desktop.preview\"}}", cid),
+                cwd="/",
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            log.write(inspect.stdout or "")
+            if inspect.returncode != 0 or inspect.stdout.strip() != build_id:
+                log.write("Refused cleanup: converter ownership label did not match.\n")
+                return
+            for command in (("container", "stop", "--time", "15", cid), ("container", "rm", "--force", cid)):
+                result = subprocess.run(
+                    podman_prefix + command,
+                    cwd="/",
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                    timeout=45,
+                )
+                log.write(result.stdout or "")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        # The stage failure remains the primary result; retain any cleanup evidence
+        # that could be written and never fall back to a global container cleanup.
+        try:
+            with cleanup_log.open("a", encoding="utf-8") as log:
+                log.write("Cleanup helper error: {0}\n".format(error))
+        except OSError:
+            pass
+
+
+def qemu_command(paths: PreviewPaths, qemu: str, acceleration: str) -> tuple[str, ...]:
+    """Return the fixed GUI VM argv; no host disk, NIC, share, or passthrough exists."""
+
+    return (
+        qemu,
+        "-machine",
+        "q35,accel={0}".format(acceleration),
+        "-cpu",
+        "max",
+        "-smp",
+        str(DEFAULT_VCPUS),
+        "-m",
+        str(DEFAULT_MEMORY_MIB),
+        "-nodefaults",
+        "-drive",
+        "if=pflash,format=raw,readonly=on,file={0}".format(OVMF_CODE),
+        "-drive",
+        "if=pflash,format=raw,file={0}".format(paths.vars_copy),
+        "-drive",
+        "if=virtio,format=qcow2,file={0}".format(paths.overlay),
+        "-device",
+        "virtio-vga",
+        "-device",
+        "qemu-xhci,id=xhci",
+        "-device",
+        "usb-kbd,bus=xhci.0",
+        "-device",
+        "usb-tablet,bus=xhci.0",
+        "-display",
+        "gtk,gl=off",
+        "-nic",
+        "none",
+        "-serial",
+        "file:{0}".format(paths.serial_log),
+        "-monitor",
+        "none",
+        "-no-reboot",
+    )
+
+
+def _run_interactive_qemu(
+    argv: tuple[str, ...],
+    paths: PreviewPaths,
+    environment: dict[str, str],
+    boot_timeout: int,
+    preexec_fn,
+) -> dict:
+    """Keep the desktop window open after its serial readiness marker appears."""
+
+    started = time.monotonic()
+    marker_after = None
+    timed_out = False
+    try:
+        with paths.qemu_log.open("xb") as handle:
+            process = subprocess.Popen(
+                argv,
+                cwd="/",
+                env=environment,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                preexec_fn=preexec_fn,
+            )
+            while process.poll() is None:
+                if marker_after is None and paths.serial_log.is_file():
+                    serial = paths.serial_log.read_text(encoding="utf-8", errors="replace")
+                    if "AUREON_DESKTOP_READY" in serial:
+                        marker_after = round(time.monotonic() - started, 3)
+                if marker_after is None and time.monotonic() - started >= boot_timeout:
+                    timed_out = True
+                    _terminate_group(process)
+                    break
+                time.sleep(0.25)
+            returncode = process.wait(timeout=15)
+    except FileExistsError as error:
+        raise PreviewError("refusing to overwrite QEMU log") from error
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PreviewError("desktop QEMU failed: {0}".format(error)) from error
+    return {
+        "returncode": returncode,
+        "desktop_ready_after_seconds": marker_after,
+        "boot_timeout_reached": timed_out,
+        "wall_duration_seconds": round(time.monotonic() - started, 3),
+    }
+
+
+def _utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def execute(plan: dict, paths: PreviewPaths, root: Path) -> dict:
+    """Build the reviewed desktop image, then open its isolated QEMU window."""
+
+    preflight = _validate_preflight(root, plan["execution"]["acceleration_policy"])
+    _require_unused_roots(paths, root)
+    expected_sources = plan["inputs"]["source_digest"]
+    if _source_digest(root)[1] != expected_sources:
+        raise PreviewError("desktop sources changed after planning; create a new plan before running")
+    started = _utc_now()
+    base_result = {"build_id": plan["build_id"], "command": "desktop-preview", "started_at_utc": started}
+    conversion_started = False
+    try:
+        _create_roots(paths, plan, root)
+        podman_prefix = preflight["podman_prefix"]
+        environment = preflight["environment"]
+        qemu = preflight["executables"]["qemu"]
+        qemu_img = preflight["executables"]["qemu_img"]
+        tag = "localhost/aureon-desktop-preview:{0}".format(plan["build_id"])
+        print("[Aureon] Descargando y preparando KDE dentro de Ubuntu WSL; puede tardar varios minutos...", file=sys.stderr, flush=True)
+        build = _run_logged(
+            podman_prefix
+            + (
+                "build",
+                "--pull=never",
+                "--network=host",
+                "--http-proxy=false",
+                "--no-cache",
+                "--format",
+                "oci",
+                "--file",
+                str(root / "system" / "desktop" / "Containerfile"),
+                "--tag",
+                tag,
+                str(root / "system" / "desktop"),
+            ),
+            paths.oci_log,
+            environment,
+            None,
+        )
+        digest = _capture(
+            podman_prefix + ("image", "inspect", "--format", "{{.Digest}}", tag), environment, 60
+        ).strip()
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise PreviewError("desktop OCI image did not expose an immutable sha256 digest")
+        platform_name = _capture(
+            podman_prefix + ("image", "inspect", "--format", "{{.Os}}/{{.Architecture}}", tag), environment, 60
+        ).strip()
+        if platform_name != "linux/amd64":
+            raise PreviewError("desktop OCI platform must be linux/amd64")
+        if _source_digest(root)[1] != expected_sources:
+            raise PreviewError("desktop sources changed during the OCI build")
+        immutable = "localhost/aureon-desktop-preview@{0}".format(digest)
+        _write_json_once(
+            paths.oci_evidence,
+            {
+                "build_id": plan["build_id"],
+                "derived_oci": immutable,
+                "local_tag": tag,
+                "platform": platform_name,
+                "build_network": "host, only for the explicit Fedora package fetch stage",
+                "guest_network": "disabled",
+                "source_digest": expected_sources,
+                "stage": build,
+                "status": "passed",
+            },
+        )
+        installed_storage = PODMAN_CONFIG / "storage.conf"
+        installed_containers = PODMAN_CONFIG / "containers.conf"
+        converter_name = "aureon-desktop-convert-" + plan["build_id"]
+        conversion_started = True
+        try:
+            print("[Aureon] Creando el disco virtual qcow2; Windows no se está instalando ni modificando...", file=sys.stderr, flush=True)
+            conversion = _run_logged(
+                podman_prefix
+                + (
+                    "run",
+                    "--rm",
+                    "--name",
+                    converter_name,
+                    "--cidfile",
+                    str(paths.conversion_cid),
+                    "--label",
+                    "io.aureon.desktop.preview={0}".format(plan["build_id"]),
+                    "--privileged",
+                    "--pull=never",
+                    "--network=none",
+                    "-e",
+                    "CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf",
+                    "-v",
+                    "{0}:/etc/containers/storage.conf:ro".format(installed_storage),
+                    "-v",
+                    "{0}:/etc/containers/containers.conf:ro".format(installed_containers),
+                    "-v",
+                    "{0}:{0}:rw".format(PODMAN_STORE),
+                    "-v",
+                    "{0}:/var/lib/containers/storage:rw".format(PODMAN_STORE),
+                    "-v",
+                    "{0}:/output:rw".format(paths.image_root),
+                    IMAGE_BUILDER_REFERENCE,
+                    "--output-dir",
+                    "/output",
+                    "build",
+                    "qcow2",
+                    "--bootc-ref",
+                    immutable,
+                    "--bootc-default-fs",
+                    "ext4",
+                    "--image-size",
+                    str(DESKTOP_IMAGE_SIZE_BYTES),
+                    "--output-name",
+                    "aureon-desktop",
+                    "--with-manifest",
+                    "--with-buildlog",
+                    "--progress",
+                    "verbose",
+                ),
+                paths.conversion_log,
+                environment,
+                CONVERSION_TIMEOUT,
+            )
+        except BaseException:
+            _cleanup_conversion(podman_prefix, paths.conversion_cid, paths.conversion_cleanup_log, plan["build_id"], environment)
+            raise
+        qcow2 = _inspect_qcow2(paths, qemu_img, environment, root)
+        _write_json_once(
+            paths.qcow2_evidence,
+            {
+                "build_id": plan["build_id"],
+                "conversion": conversion,
+                "guest_network": "disabled",
+                "source_oci": immutable,
+                "status": "passed",
+                **qcow2,
+            },
+        )
+        base_hash_before = qcow2["sha256"]
+        _copy_file_exclusive(OVMF_VARS, paths.vars_copy)
+        _run_logged(
+            (qemu_img, "create", "-f", "qcow2", "-F", "qcow2", "-b", str(paths.disk), str(paths.overlay)),
+            paths.overlay_log,
+            environment,
+            120,
+        )
+        uid, gid, _, _, groups = preflight["identity"]
+        _make_base_readonly_for_preview(paths)
+        _transfer_work_to_user(paths, uid, gid)
+        command = qemu_command(paths, qemu, preflight["acceleration"])
+        print("[Aureon] Abriendo la ventana del escritorio KDE. Apágala desde el menú cuando termines.", file=sys.stderr, flush=True)
+        qemu_result = _run_interactive_qemu(
+            command,
+            paths,
+            preflight["gui_environment"],
+            plan["execution"]["boot_timeout_seconds"],
+            _qemu_preexec(uid, gid, groups),
+        )
+        if qemu_result["boot_timeout_reached"]:
+            raise PreviewError("desktop did not emit its readiness marker before the configured boot timeout")
+        if qemu_result["returncode"] != 0:
+            raise PreviewError("QEMU exited {0}; inspect its preserved log".format(qemu_result["returncode"]))
+        if qemu_result["desktop_ready_after_seconds"] is None:
+            raise PreviewError("desktop QEMU exited without the readiness marker")
+        base_hash_after = _hash_file(paths.disk)
+        if base_hash_before != base_hash_after:
+            raise PreviewError("the base desktop qcow2 changed; refusing to report a usable preview")
+        overlay_check = _capture((qemu_img, "check", str(paths.overlay)), environment, 180).strip()
+        preview = {
+            "build_id": plan["build_id"],
+            "status": "passed",
+            "desktop_ready_after_seconds": qemu_result["desktop_ready_after_seconds"],
+            "wall_duration_seconds": qemu_result["wall_duration_seconds"],
+            "qemu": {
+                "arguments": list(command[1:]),
+                "acceleration": preflight["acceleration"],
+                "guest_network": "none",
+                "host_directories_shared_with_guest": False,
+                "physical_usb_passthrough": False,
+                "base_qcow2_sha256_before_and_after": base_hash_after,
+                "overlay_integrity_check": overlay_check or "qemu-img check exited 0",
+                "display": "gtk,gl=off via WSLg",
+            },
+            "artifacts": {
+                "base_qcow2": _relative(paths.disk, root),
+                "overlay": _relative(paths.overlay, root),
+                "serial_log": _relative(paths.serial_log, root),
+                "qemu_log": _relative(paths.qemu_log, root),
+            },
+        }
+        _write_json_once(paths.preview_evidence, preview)
+        result = dict(base_result)
+        result.update({"completed_at_utc": _utc_now(), "status": "passed", "preview": _relative(paths.preview_evidence, root)})
+        _write_json_once(paths.result, result)
+        return result
+    except (OSError, PreviewError) as error:
+        failed = dict(base_result)
+        failed.update({"completed_at_utc": _utc_now(), "status": "failed", "error": str(error)})
+        try:
+            if paths.build_root.is_dir() and not paths.result.exists():
+                _write_json_once(paths.result, failed)
+        except (OSError, PreviewError):
+            pass
+        raise PreviewError(str(error)) from error
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the safe dry-run-first command line interface."""
+
+    parser = argparse.ArgumentParser(
+        prog=PROGRAM,
+        description="Prepare and open the isolated Aureon KDE desktop preview in a WSLg QEMU window.",
+    )
+    parser.add_argument("--build-id", default="desktop-preview", help="new portable preview identifier")
+    parser.add_argument("--dry-run", action="store_true", help="print the no-write plan (default)")
+    parser.add_argument("--execute", action="store_true", help="build the VM image and open its disposable QEMU window")
+    parser.add_argument(
+        "--allow-build-network",
+        action="store_true",
+        help="acknowledge the one package-fetch stage; conversion and guest networking remain disabled",
+    )
+    parser.add_argument(
+        "--boot-timeout-seconds",
+        type=int,
+        default=DEFAULT_BOOT_TIMEOUT,
+        help="maximum seconds to wait for the desktop marker before the window is stopped",
+    )
+    parser.add_argument("--accel", choices=("auto", "kvm", "tcg"), default="auto")
+    return parser
+
+
+def main(argv: list[str] | None = None, output=None) -> int:
+    """Run a no-write plan by default, or the explicitly authorized desktop flow."""
+
+    output = output if output is not None else sys.stdout
+    args = build_parser().parse_args(argv)
+    if args.dry_run and args.execute:
+        print("{0}: choose either --dry-run or --execute, not both".format(PROGRAM), file=output)
+        return 4
+    try:
+        build_id = validate_build_id(args.build_id)
+        plan = create_plan(build_id, args.boot_timeout_seconds, args.accel, ROOT)
+        paths = preview_paths(build_id, ROOT)
+    except PreviewError as error:
+        print("{0}: rejected: {1}".format(PROGRAM, error), file=output)
+        return 4
+    if not args.execute:
+        print(json.dumps(plan, ensure_ascii=True, indent=2, sort_keys=True), file=output)
+        return 0
+    if not args.allow_build_network:
+        print(
+            "{0}: --execute requires --allow-build-network because the first desktop image fetches the explicitly listed Fedora packages. The guest VM remains offline.".format(PROGRAM),
+            file=output,
+        )
+        return 4
+    try:
+        _require_unused_roots(paths, ROOT)
+        result = execute(plan, paths, ROOT)
+    except PreviewError as error:
+        print("{0}: stopped safely: {1}".format(PROGRAM, error), file=output)
+        print("Any evidence already created is kept. Windows, its boot settings, and physical disks were not targets.", file=output)
+        return 6
+    print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True), file=output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

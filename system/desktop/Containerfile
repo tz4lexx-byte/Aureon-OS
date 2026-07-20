@@ -1,0 +1,44 @@
+# Aureon Desktop Preview -- never installed onto the Windows host.
+#
+# This is intentionally separate from ../Containerfile: Phase 0 stays a
+# headless, auto-shutting smoke image while this profile is an interactive VM.
+FROM quay.io/fedora/fedora-bootc@sha256:86cd97f1e7962e30f52f35ae1c0719299df4f681492b133ea4bcdb74d154fb92
+
+LABEL org.opencontainers.image.title="Aureon OS Desktop Preview"
+LABEL org.opencontainers.image.description="KDE Plasma preview for an isolated QEMU VM only"
+LABEL org.opencontainers.image.vendor="Aureon OS"
+LABEL org.opencontainers.image.source-profile="desktop-preview"
+
+# The first preparation of this developer-only image deliberately uses Fedora
+# package repositories.  The launcher requires an explicit --allow-build-network
+# acknowledgement for that stage and subsequently converts/runs with no guest
+# network.  Package names are listed individually instead of using a mutable
+# desktop group, so the visual surface remains reviewable in source control.
+RUN mkdir -p /var/roothome && \
+    dnf -y install \
+      greetd \
+      greetd-selinux \
+      dbus-daemon \
+      plasma-desktop \
+      plasma-workspace \
+      plasma-workspace-wayland \
+      kwin-wayland \
+      xdg-desktop-portal-kde \
+      mesa-dri-drivers \
+      pipewire \
+      wireplumber \
+      dolphin \
+      konsole && \
+    dnf -y clean all && \
+    rm -rf /var/cache/dnf
+
+COPY overlays/ /
+
+# `aureon` exists only inside the disposable VM.  Its password is locked and it
+# is deliberately not a sudo/wheel user.  greetd starts Plasma for it once per
+# boot, so no PC password, guest password, SSH key, or remote login is needed.
+RUN useradd --create-home --uid 1000 --shell /bin/bash aureon && \
+    passwd --lock aureon && \
+    install -d -m 0755 /usr/lib/systemd/system/multi-user.target.wants && \
+    ln -s ../greetd.service /usr/lib/systemd/system/multi-user.target.wants/greetd.service && \
+    ln -s ../aureon-desktop-ready.service /usr/lib/systemd/system/multi-user.target.wants/aureon-desktop-ready.service

@@ -1,0 +1,13 @@
+# Disposable local session used only by the Aureon QEMU desktop preview.
+# The guest has no virtual NIC.
+
+[terminal]
+vt = 1
+
+[default_session]
+command = "agreety --cmd 'dbus-run-session -- startplasma-wayland'"
+user = "greetd"
+
+[initial_session]
+command = "dbus-run-session -- startplasma-wayland"
+user = "aureon"

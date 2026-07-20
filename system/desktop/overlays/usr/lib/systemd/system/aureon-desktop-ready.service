@@ -1,0 +1,31 @@
+[Unit]
+Description=Aureon desktop preview readiness marker
+ConditionVirtualization=vm
+After=greetd.service
+Wants=greetd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/echo AUREON_DESKTOP_READY
+StandardOutput=journal+console
+StandardError=journal+console
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

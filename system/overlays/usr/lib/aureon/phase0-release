@@ -1,0 +1,5 @@
+# Guest metadata only; this is not host configuration.
+AUREON_OS_NAME="Aureon OS"
+AUREON_PHASE="0"
+AUREON_PROFILE="minimal-vm"
+AUREON_READINESS_MARKER="AUREON_PHASE0_READY"

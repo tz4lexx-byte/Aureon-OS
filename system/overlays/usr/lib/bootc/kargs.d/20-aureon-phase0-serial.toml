@@ -1,0 +1,4 @@
+# Emit the Phase 0 boot and readiness evidence to QEMU's first serial port.
+# `console=` is intentionally repeated: tty0 retains the local display while
+# ttyS0 becomes the primary console used by the headless smoke test.
+kargs = ["console=tty0", "console=ttyS0,115200n8"]

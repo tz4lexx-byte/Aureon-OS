@@ -1,0 +1,7 @@
+[Plugins]
+blurEnabled=true
+contrastEnabled=true
+
+[org.kde.kdecoration2]
+library=org.kde.breeze
+theme=Breeze

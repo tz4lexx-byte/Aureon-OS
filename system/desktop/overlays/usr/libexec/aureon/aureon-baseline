@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -u
+
+value()
+{
+    printf '%s=%s\n' "$1" "$2"
+}
+
+count_nonempty()
+{
+    awk 'NF { count++ } END { print count + 0 }'
+}
+
+value report_format "aureon-baseline-v1"
+value timestamp_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+if [ -r /etc/os-release ]; then
+    . /etc/os-release
+fi
+
+value os_pretty_name "${PRETTY_NAME:-unknown}"
+value kernel "$(uname -r)"
+value architecture "$(uname -m)"
+
+uptime_seconds="$(awk '{ printf "%.0f", $1 }' /proc/uptime 2>/dev/null || printf 0)"
+value uptime_seconds "$uptime_seconds"
+
+mem_total_kib="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+mem_available_kib="$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)"
+
+value memory_total_mib "$(( ${mem_total_kib:-0} / 1024 ))"
+value memory_available_mib "$(( ${mem_available_kib:-0} / 1024 ))"
+value memory_used_estimated_mib "$(( (${mem_total_kib:-0} - ${mem_available_kib:-0}) / 1024 ))"
+
+value process_count "$(ps -e --no-headers 2>/dev/null | count_nonempty)"
+
+if command -v systemctl >/dev/null 2>&1; then
+    value running_services "$(
+        systemctl list-units \
+            --type=service \
+            --state=running \
+            --no-legend \
+            --no-pager 2>/dev/null |
+        count_nonempty
+    )"
+
+    value failed_units "$(
+        systemctl --failed \
+            --no-legend \
+            --no-pager 2>/dev/null |
+        count_nonempty
+    )"
+else
+    value running_services "unavailable"
+    value failed_units "unavailable"
+fi
+
+root_used_bytes="$(df -B1 / 2>/dev/null | awk 'NR == 2 { print $3 }')"
+root_available_bytes="$(df -B1 / 2>/dev/null | awk 'NR == 2 { print $4 }')"
+
+value root_used_mib "$(( ${root_used_bytes:-0} / 1024 / 1024 ))"
+value root_available_mib "$(( ${root_available_bytes:-0} / 1024 / 1024 ))"
+
+if [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ]; then
+    value cgroup_mode "v2"
+else
+    value cgroup_mode "other"
+fi
+
+if [ -e /dev/ntsync ]; then
+    value ntsync_device "present"
+else
+    value ntsync_device "absent"
+fi
+
+if grep -q '^ntsync ' /proc/modules 2>/dev/null; then
+    value ntsync_module "loaded"
+else
+    value ntsync_module "not-loaded"
+fi
+
+if command -v getenforce >/dev/null 2>&1; then
+    value selinux "$(getenforce)"
+else
+    value selinux "unavailable"
+fi
+
+if command -v vulkaninfo >/dev/null 2>&1; then
+    value vulkaninfo "installed"
+else
+    value vulkaninfo "missing"
+fi
+
+if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze time 2>/dev/null |
+        sed 's/^/boot_time=/'
+fi
+
+for pressure_type in cpu memory io; do
+    pressure_file="/proc/pressure/$pressure_type"
+
+    if [ -r "$pressure_file" ]; then
+        while IFS= read -r pressure_line; do
+            printf 'psi_%s=%s\n' "$pressure_type" "$pressure_line"
+        done < "$pressure_file"
+    fi
+done
+
+printf '\n[top_memory_processes]\n'
+ps -eo pid,comm,rss,%cpu \
+    --sort=-rss 2>/dev/null |
+    head -n 11
+
+printf '\n[failed_units]\n'
+systemctl --failed \
+    --no-pager 2>/dev/null || true

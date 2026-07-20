@@ -1,0 +1,51 @@
+# Python and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+
+# Local development state and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp
+secrets/
+**/secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.pkcs12
+*.age
+
+# Generated artifacts: canonical roots are build/, images/, and work/qemu/.
+# Preserve their documentation only; no image, snapshot, serial log, or manifest
+# belongs in Git unless it is deliberately moved to a reviewed fixture location.
+/build/*
+!/build/README.md
+/images/*
+!/images/README.md
+/work/*
+/outputs/*
+
+# Container and operating-system artifacts
+*.oci.tar
+*.sbom.spdx.json
+# Public signatures and certificates are intentionally not ignored. Their
+# provenance must be reviewed before they are committed.
+
+# Platform-specific files
+Thumbs.db
+Desktop.ini
+.DS_Store
+/build/
+/images/
+/work/
+*.pyc
+.mypy_cache/

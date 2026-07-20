@@ -1,0 +1,16 @@
+{
+  "KPlugin": {
+    "Authors": [
+      {
+        "Name": "Aureon OS Project"
+      }
+    ],
+    "Description": "Aureon OS glass-inspired Plasma desktop",
+    "EnabledByDefault": true,
+    "Id": "org.aureon.desktop",
+    "License": "GPL-3.0-or-later",
+    "Name": "Aureon Glass",
+    "Version": "0.1.0"
+  },
+  "X-Plasma-APIVersion": "2"
+}

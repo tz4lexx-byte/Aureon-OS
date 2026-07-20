@@ -1,0 +1,14 @@
+# Keep source and documentation portable between Windows, WSL, and CI.
+* text=auto eol=lf
+
+# Do not attempt text conversion for generated binary artifacts if an approved
+# fixture is deliberately committed later.
+*.qcow2 binary
+*.raw binary
+*.iso binary
+*.img binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.svg text

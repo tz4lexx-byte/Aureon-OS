@@ -1,0 +1,9 @@
+[KDE]
+LookAndFeelPackage=org.aureon.desktop
+widgetStyle=Breeze
+
+[General]
+ColorScheme=BreezeDark
+
+[Icons]
+Theme=breeze

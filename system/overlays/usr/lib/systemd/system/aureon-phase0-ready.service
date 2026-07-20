@@ -1,0 +1,33 @@
+[Unit]
+Description=Aureon OS Phase 0 VM readiness marker
+Documentation=https://github.com/bootc-dev/bootc
+ConditionVirtualization=vm
+After=local-fs.target systemd-journald.service
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/echo AUREON_PHASE0_READY
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
