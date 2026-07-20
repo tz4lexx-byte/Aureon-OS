@@ -22,6 +22,36 @@ value os_pretty_name "${PRETTY_NAME:-unknown}"
 value kernel "$(uname -r)"
 value architecture "$(uname -m)"
 
+virtualization_kind="none"
+
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+    detected_virtualization="$(
+        systemd-detect-virt 2>/dev/null || true
+    )"
+
+    if [ -n "$detected_virtualization" ]; then
+        virtualization_kind="$detected_virtualization"
+    fi
+elif grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+    virtualization_kind="wsl"
+fi
+
+if [ "$virtualization_kind" = "wsl" ] ||
+    grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+    environment_kind="wsl-development"
+elif [ -n "${AUREON_VERSION:-}" ]; then
+    if [ "$virtualization_kind" = "none" ]; then
+        environment_kind="aureon-physical"
+    else
+        environment_kind="aureon-virtual"
+    fi
+else
+    environment_kind="linux-other"
+fi
+
+value virtualization_kind "$virtualization_kind"
+value environment_kind "$environment_kind"
+
 uptime_seconds="$(awk '{ printf "%.0f", $1 }' /proc/uptime 2>/dev/null || printf 0)"
 value uptime_seconds "$uptime_seconds"
 
@@ -60,6 +90,14 @@ root_available_bytes="$(df -B1 / 2>/dev/null | awk 'NR == 2 { print $4 }')"
 
 value root_used_mib "$(( ${root_used_bytes:-0} / 1024 / 1024 ))"
 value root_available_mib "$(( ${root_available_bytes:-0} / 1024 / 1024 ))"
+
+root_filesystem="$(
+    findmnt -n -o FSTYPE / 2>/dev/null ||
+    stat -fc %T / 2>/dev/null ||
+    printf unknown
+)"
+
+value root_filesystem "$root_filesystem"
 
 if [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ]; then
     value cgroup_mode "v2"
