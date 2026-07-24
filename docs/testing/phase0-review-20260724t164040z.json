@@ -1,0 +1,53 @@
+{
+  "artifacts": {
+    "base_qcow2": {
+      "path": "images/phase0-review-20260724t164040z/aureon-base.qcow2",
+      "sha256": "db5359bfe2451a3be20c864af81d168e4b96e4fa4682b1cd401eae3003f327d7",
+      "size_bytes": 1308229632
+    },
+    "original_paths": {
+      "base_qcow2": "images/phase0-review-20260724t164040z/aureon-base.qcow2",
+      "overlay": "work/qemu/phase0-review-20260724t164040z/smoke-overlay.qcow2",
+      "qemu_log": "work/qemu/phase0-review-20260724t164040z/qemu.log",
+      "serial_log": "work/qemu/phase0-review-20260724t164040z/serial.log",
+      "smoke_json": "work/qemu/phase0-review-20260724t164040z/smoke.json"
+    },
+    "overlay": {
+      "path": "work/qemu/phase0-review-20260724t164040z/smoke-overlay.qcow2",
+      "sha256": "635ed396db5935062dc4368e1dfb73bbb47134b794e4afb97a672797baef98a4",
+      "size_bytes": 24641536
+    },
+    "overlay_integrity": {
+      "details": "No errors were found on the image.\n361/188288 = 0.19% allocated, 8.03% fragmented, 0.00% compressed clusters\nImage end offset: 24641536",
+      "result": "No errors were found on the image."
+    },
+    "qemu_log": {
+      "path": "work/qemu/phase0-review-20260724t164040z/qemu.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    "serial_log": {
+      "path": "work/qemu/phase0-review-20260724t164040z/serial.log",
+      "sha256": "113cddae710a9651099c3f450b6e91a909b98a6725fa0b9d0630ca1d2ee3be50",
+      "size_bytes": 113415
+    }
+  },
+  "base_sha256_before_and_after": "db5359bfe2451a3be20c864af81d168e4b96e4fa4682b1cd401eae3003f327d7",
+  "base_storage_mode": "copy-on-write backing file; no base writes accepted",
+  "build_id": "phase0-review-20260724t164040z",
+  "guest_network": "none",
+  "host_directories_mounted_in_guest": false,
+  "physical_block_devices_accessed": false,
+  "qemu": {
+    "acceleration": "kvm",
+    "memory_mib": 4096,
+    "vcpus": 2
+  },
+  "qemu_exit_code": 0,
+  "readiness_after_seconds": 63.733,
+  "schema_version": 1,
+  "status": "passed",
+  "timeout_reached": false,
+  "wall_duration_seconds": 75.488,
+  "windows_install_or_boot_changes": false
+}
