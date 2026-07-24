@@ -2,9 +2,10 @@
 """Safe, dependency-free command-line entry point for Aureon OS development.
 
 ``doctor`` is a read-only preflight, while ``build`` and ``image`` print
-deterministic dry-run plans.  The deliberately narrow ``test-smoke`` runner is
-the only state-changing Phase 0 command: it runs only as root inside Linux/WSL,
-uses fixed virtual-artifact paths, and never accepts a host disk as input.
+deterministic dry-run plans.  The deliberately narrow ``test-smoke`` runner
+owns the state-changing Phase 0 flow; ``measure-smoke`` only orchestrates that
+runner. Both execute only as root inside Linux/WSL, use fixed virtual-artifact
+paths, and never accept a host disk as input.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import re
 import shutil
 import signal
 import stat
+import statistics
 import subprocess
 import sys
 import time
@@ -48,6 +50,10 @@ SMOKE_TIMEOUT_MAX_SECONDS = 900
 SMOKE_STAGE_TIMEOUT_SECONDS = 1800
 SMOKE_MEMORY_MIB = 4096
 SMOKE_VCPUS = 2
+MEASUREMENT_RUNS_MIN = 1
+MEASUREMENT_RUNS_MAX = 20
+MEASUREMENT_SCHEMA = "aureon.smoke-measurement"
+MEASUREMENT_VERSION = 1
 SMOKE_IMAGE_SIZE_BYTES = 10 * 1024 * 1024 * 1024
 PHASE0_BASE_REFERENCE = (
     "quay.io/fedora/fedora-bootc@sha256:"
@@ -352,6 +358,51 @@ def build_parser():
         help="QEMU acceleration policy; auto uses KVM when available, otherwise TCG",
     )
     smoke_parser.set_defaults(command="test-smoke")
+
+    measurement_parser = subparsers.add_parser(
+        "measure-smoke",
+        help="plan or execute repeated isolated smoke measurements",
+        description=(
+            "Orchestrate deterministic test-smoke repetitions. Dry-run is read-only; "
+            "--execute requires existing privileges and never invokes sudo."
+        ),
+    )
+    measurement_parser.add_argument(
+        "--run-id",
+        required=True,
+        metavar="ID",
+        help="safe measurement identifier used to derive <run-id>-rNN build IDs",
+    )
+    measurement_parser.add_argument(
+        "--runs",
+        type=int,
+        required=True,
+        metavar="COUNT",
+        help="number of repetitions from 1 to 20",
+    )
+    measurement_parser.add_argument(
+        "--baseline",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="repository-local Phase 0 evidence JSON used for comparison",
+    )
+    measurement_mode = measurement_parser.add_mutually_exclusive_group()
+    measurement_mode.add_argument(
+        "--dry-run",
+        dest="execution_mode",
+        action="store_const",
+        const="dry-run",
+        help="print the complete no-write measurement plan (default)",
+    )
+    measurement_mode.add_argument(
+        "--execute",
+        dest="execution_mode",
+        action="store_const",
+        const="execute",
+        help="run repetitions with current privileges; never invokes sudo",
+    )
+    measurement_parser.set_defaults(command="measure-smoke", execution_mode="dry-run")
 
     for command, contract in PENDING_COMMANDS.items():
         pending_parser = subparsers.add_parser(
@@ -726,6 +777,193 @@ def validate_smoke_timeout(timeout_seconds):
         )
     return timeout_seconds
 
+
+def validate_measurement_runs(runs):
+    """Accept only a bounded, non-boolean repetition count."""
+
+    if not isinstance(runs, int) or isinstance(runs, bool):
+        raise PlanValidationError("measurement runs must be an integer")
+    if not MEASUREMENT_RUNS_MIN <= runs <= MEASUREMENT_RUNS_MAX:
+        raise PlanValidationError(
+            "measurement runs must be between {0} and {1}".format(
+                MEASUREMENT_RUNS_MIN, MEASUREMENT_RUNS_MAX
+            )
+        )
+    return runs
+
+
+def measurement_build_ids(run_id, runs):
+    """Derive stable, unique smoke build IDs for every repetition."""
+
+    run_id = validate_build_id(run_id)
+    runs = validate_measurement_runs(runs)
+    suffix_length = len("-r{0:02d}".format(runs))
+    if len(run_id) + suffix_length > 63:
+        raise PlanValidationError(
+            "measurement run id '{0}' is too long: the required '-rNN' suffix "
+            "must keep every derived build id within 63 characters".format(run_id)
+        )
+    build_ids = tuple("{0}-r{1:02d}".format(run_id, index) for index in range(1, runs + 1))
+    for build_id in build_ids:
+        validate_build_id(build_id)
+    return build_ids
+
+
+def _reject_private_absolute_paths(value, location="$"):
+    """Reject absolute paths in imported or generated portable evidence."""
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _reject_private_absolute_paths(child, "{0}.{1}".format(location, key))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _reject_private_absolute_paths(child, "{0}[{1}]".format(location, index))
+    elif isinstance(value, str):
+        if Path(value).is_absolute() or re.match(r"^[A-Za-z]:[\\\\/]", value):
+            raise PlanValidationError(
+                "absolute private path is forbidden in measurement evidence at {0}".format(location)
+            )
+
+
+def load_measurement_baseline(path, repository_root=REPOSITORY_ROOT):
+    """Load and validate one repository-local Phase 0 measurement baseline."""
+
+    baseline_path = repository_path(path, "measurement baseline", repository_root)
+    try:
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PlanValidationError("could not load measurement baseline: {0}".format(error)) from error
+    if not isinstance(baseline, dict):
+        raise PlanValidationError("measurement baseline must contain a JSON object")
+    required = ("readiness_after_seconds", "wall_duration_seconds")
+    for field in required:
+        value = baseline.get(field)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise PlanValidationError("measurement baseline has invalid '{0}'".format(field))
+    _reject_private_absolute_paths(baseline)
+    return baseline, relative_repository_path(baseline_path, repository_root)
+
+
+def create_measurement_plan(run_id, runs, baseline_path, repository_root=REPOSITORY_ROOT):
+    """Create a deterministic, read-only plan around existing smoke plans."""
+
+    baseline, relative_baseline = load_measurement_baseline(baseline_path, repository_root)
+    build_ids = measurement_build_ids(run_id, runs)
+    return {
+        "baseline": {
+            "path": relative_baseline,
+            "readiness_after_seconds": baseline["readiness_after_seconds"],
+            "wall_duration_seconds": baseline["wall_duration_seconds"],
+        },
+        "command": "measure-smoke",
+        "constraints": {
+            "guest_network": "none",
+            "host_directories_mounted_in_guest": False,
+            "physical_block_devices_accessed": False,
+            "windows_install_or_boot_changes": False,
+            "base_storage_mode": "independent copy-on-write overlay per run",
+            "privilege_escalation": "never",
+        },
+        "execution": {"mode": "dry-run", "writes": False},
+        "outputs": {
+            "measurement_json": "work/measurements/{0}/measurement.json".format(run_id),
+            "measurement_markdown": "work/measurements/{0}/measurement.md".format(run_id),
+            "run_evidence": [
+                "work/measurements/{0}/runs/r{1:02d}.json".format(run_id, index)
+                for index in range(1, runs + 1)
+            ],
+        },
+        "run_id": validate_build_id(run_id),
+        "runs": [
+            {"build_id": build_id, "repetition": index}
+            for index, build_id in enumerate(build_ids, start=1)
+        ],
+        "schema": MEASUREMENT_SCHEMA + "-plan",
+        "version": MEASUREMENT_VERSION,
+    }
+
+
+def _numeric_summary(values):
+    """Return deterministic descriptive statistics for a non-empty sequence."""
+
+    numbers = [float(value) for value in values]
+    if not numbers:
+        return {"maximum": None, "mean": None, "median": None, "minimum": None}
+    return {
+        "maximum": max(numbers),
+        "mean": statistics.fmean(numbers),
+        "median": statistics.median(numbers),
+        "minimum": min(numbers),
+    }
+
+
+def _percentage_change(value, baseline):
+    if value is None or baseline == 0:
+        return None
+    return ((value - baseline) / baseline) * 100.0
+
+
+def aggregate_measurement(run_id, requested, baseline_path, baseline, results):
+    """Aggregate completed run records without timestamps or private paths."""
+
+    completed = len(results)
+    passed = sum(result.get("status") == "passed" for result in results)
+    failed = sum(result.get("status") == "failed" for result in results)
+    readiness = _numeric_summary(
+        result["readiness_after_seconds"]
+        for result in results
+        if isinstance(result.get("readiness_after_seconds"), (int, float))
+    )
+    duration = _numeric_summary(
+        result["wall_duration_seconds"]
+        for result in results
+        if isinstance(result.get("wall_duration_seconds"), (int, float))
+    )
+    overlay_sizes = _numeric_summary(
+        result["artifacts"]["overlay"]["size_bytes"]
+        for result in results
+        if isinstance(result.get("artifacts", {}).get("overlay", {}).get("size_bytes"), int)
+    )
+    if failed:
+        overall = "failed"
+    elif completed < requested:
+        overall = "incomplete"
+    else:
+        overall = "passed"
+    measurement = {
+        "baseline": {
+            "path": baseline_path,
+            "readiness_after_seconds": baseline["readiness_after_seconds"],
+            "wall_duration_seconds": baseline["wall_duration_seconds"],
+        },
+        "run_id": run_id,
+        "runs": results,
+        "schema": MEASUREMENT_SCHEMA,
+        "summary": {
+            "acceleration": sorted(
+                {result.get("acceleration") for result in results if result.get("acceleration")}
+            ),
+            "completed": completed,
+            "duration_seconds": duration,
+            "failed": failed,
+            "overlay_size_bytes": overlay_sizes,
+            "passed": passed,
+            "readiness_seconds": readiness,
+            "requested": requested,
+            "status": overall,
+            "variation_percent_from_baseline": {
+                "readiness_mean": _percentage_change(
+                    readiness["mean"], baseline["readiness_after_seconds"]
+                ),
+                "wall_duration_mean": _percentage_change(
+                    duration["mean"], baseline["wall_duration_seconds"]
+                ),
+            },
+        },
+        "version": MEASUREMENT_VERSION,
+    }
+    _reject_private_absolute_paths(measurement)
+    return measurement
 
 def smoke_paths(build_id, repository_root=REPOSITORY_ROOT):
     """Return the fixed, repository-local artifact topology for one smoke run."""
@@ -1649,6 +1887,179 @@ def execute_smoke_plan(
         raise SmokeRunnerError(str(error)) from error
 
 
+def _optional_artifact_record(path, repository_root):
+    """Record a smoke artifact when present, otherwise retain explicit null evidence."""
+
+    try:
+        return _artifact_record(path, repository_root)
+    except (OSError, SmokeRunnerError):
+        return {"path": relative_repository_path(path, repository_root), "sha256": None, "size_bytes": None}
+
+
+def measurement_run_record(build_id, paths, status, repository_root=REPOSITORY_ROOT, error=None):
+    """Normalize one test-smoke evidence set into the Phase 1 run schema."""
+
+    smoke = {}
+    if paths.smoke.is_file() and not paths.smoke.is_symlink():
+        try:
+            smoke = json.loads(paths.smoke.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            smoke = {}
+    qemu = smoke.get("qemu", {})
+    scope = smoke.get("scope", {})
+    artifacts = smoke.get("artifacts", {})
+    record = {
+        "acceleration": qemu.get("acceleration"),
+        "artifacts": {
+            "base_qcow2": _optional_artifact_record(paths.disk, repository_root),
+            "overlay": artifacts.get("overlay")
+            or _optional_artifact_record(paths.overlay, repository_root),
+            "qemu_log": artifacts.get("qemu_log")
+            or _optional_artifact_record(paths.qemu_log, repository_root),
+            "serial_log": artifacts.get("serial_log")
+            or _optional_artifact_record(paths.serial_log, repository_root),
+        },
+        "base_sha256_before_and_after": qemu.get("base_sha256_before_and_after"),
+        "build_id": build_id,
+        "guest_network": qemu.get("guest_network", "none"),
+        "host_directories_mounted_in_guest": qemu.get(
+            "host_directories_mounted_in_guest", False
+        ),
+        "memory_mib": qemu.get("memory_mib", SMOKE_MEMORY_MIB),
+        "overlay_integrity": qemu.get("overlay_integrity_check"),
+        "physical_block_devices_accessed": scope.get(
+            "physical_block_devices_accessed", False
+        ),
+        "qemu_exit_code": smoke.get("qemu_exit_code"),
+        "readiness_after_seconds": smoke.get("readiness_after_seconds"),
+        "status": status,
+        "timeout_reached": smoke.get("timeout_reached", False),
+        "vcpus": qemu.get("vcpus", SMOKE_VCPUS),
+        "wall_duration_seconds": smoke.get("wall_duration_seconds"),
+        "windows_install_or_boot_changes": scope.get(
+            "windows_install_or_boot_changes", False
+        ),
+    }
+    if error is not None:
+        record["error"] = str(error).replace(str(Path(repository_root).resolve()), ".")
+    _reject_private_absolute_paths(record)
+    return record
+
+
+def _measurement_markdown(measurement):
+    """Render a compact deterministic human-readable summary."""
+
+    summary = measurement["summary"]
+    lines = [
+        "# Smoke measurement: {0}".format(measurement["run_id"]),
+        "",
+        "- Status: `{0}`".format(summary["status"]),
+        "- Requested: {0}".format(summary["requested"]),
+        "- Completed: {0}".format(summary["completed"]),
+        "- Passed: {0}".format(summary["passed"]),
+        "- Failed: {0}".format(summary["failed"]),
+        "",
+        "| Repetition | Build ID | Status | Readiness (s) | Duration (s) |",
+        "| --- | --- | --- | ---: | ---: |",
+    ]
+    for index, result in enumerate(measurement["runs"], start=1):
+        lines.append(
+            "| r{0:02d} | `{1}` | {2} | {3} | {4} |".format(
+                index,
+                result["build_id"],
+                result["status"],
+                result["readiness_after_seconds"],
+                result["wall_duration_seconds"],
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def execute_measurement(plan, baseline, baseline_path, repository_root=REPOSITORY_ROOT):
+    """Run test-smoke repetitions sequentially and preserve evidence on first failure."""
+
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise SmokeRunnerError(
+            "measure-smoke --execute requires existing root privileges; "
+            "automatic privilege elevation and sudo are forbidden"
+        )
+    root = Path(repository_root).resolve()
+    measurement_root = root / "work" / "measurements" / plan["run_id"]
+    runs_root = measurement_root / "runs"
+    repository_path(measurement_root, "measurement output", root)
+    if measurement_root.exists() or measurement_root.is_symlink():
+        raise SmokeRunnerError(
+            "refusing to overwrite existing measurement directory '{0}'".format(
+                relative_repository_path(measurement_root, root)
+            )
+        )
+    results = []
+    try:
+        runs_root.mkdir(parents=True, exist_ok=False)
+        for index, planned_run in enumerate(plan["runs"], start=1):
+            build_id = planned_run["build_id"]
+            paths = smoke_paths(build_id, root)
+            smoke_plan = create_smoke_plan(build_id, repository_root=root)
+            status = "passed"
+            error = None
+            try:
+                require_unused_smoke_output_roots(paths, root)
+                execute_smoke_plan(smoke_plan, paths, repository_root=root)
+            except (PlanValidationError, SmokeRunnerError) as run_error:
+                status = "failed"
+                error = run_error
+            record = measurement_run_record(build_id, paths, status, root, error)
+            results.append(record)
+            _write_json_once(runs_root / "r{0:02d}.json".format(index), record)
+            if status == "failed":
+                break
+        measurement = aggregate_measurement(
+            plan["run_id"], len(plan["runs"]), baseline_path, baseline, results
+        )
+        _write_json_once(measurement_root / "measurement.json", measurement)
+        try:
+            with (measurement_root / "measurement.md").open(
+                "x", encoding="utf-8", newline="\n"
+            ) as handle:
+                handle.write(_measurement_markdown(measurement))
+        except FileExistsError as error:
+            raise SmokeRunnerError("refusing to overwrite measurement.md") from error
+        return measurement
+    except OSError as error:
+        raise SmokeRunnerError("could not preserve measurement evidence: {0}".format(error)) from error
+
+
+def run_measurement(workspace, run_id, runs, baseline_path, execution_mode, output):
+    """Print a no-write measurement plan or execute it without elevation."""
+
+    try:
+        inspection_scope = canonical_workspace(workspace)
+        baseline, relative_baseline = load_measurement_baseline(baseline_path)
+        plan = create_measurement_plan(run_id, runs, baseline_path)
+    except WorkspaceScopeError as error:
+        return report_workspace_rejection(error, output)
+    except PlanValidationError as error:
+        return report_plan_rejection(error, output)
+    if execution_mode == "dry-run":
+        print(json.dumps(plan, ensure_ascii=True, indent=2, sort_keys=True), file=output)
+        return 0
+    if inspection_scope != REPOSITORY_ROOT:
+        print(
+            "{0}: measure-smoke --execute requires the checkout root as --workspace.".format(
+                PROGRAM_NAME
+            ),
+            file=output,
+        )
+        return UNSAFE_INPUT_EXIT_CODE
+    try:
+        measurement = execute_measurement(plan, baseline, relative_baseline)
+    except SmokeRunnerError as error:
+        print("{0}: measure-smoke failed safely: {1}".format(PROGRAM_NAME, error), file=output)
+        return RUNNER_FAILURE_EXIT_CODE
+    print(json.dumps(measurement["summary"], ensure_ascii=True, indent=2, sort_keys=True), file=output)
+    return 0 if measurement["summary"]["status"] == "passed" else RUNNER_FAILURE_EXIT_CODE
+
+
 def run_smoke(workspace, build_id, execution_mode, timeout_seconds, acceleration, output):
     """Print a no-write plan or execute the fixed Phase 0 smoke pipeline."""
 
@@ -2242,6 +2653,15 @@ def main(argv=None, stdout=None):
             args.execution_mode,
             args.timeout_seconds,
             args.accel,
+            output,
+        )
+    if args.command == "measure-smoke":
+        return run_measurement(
+            args.workspace,
+            args.run_id,
+            args.runs,
+            args.baseline,
+            args.execution_mode,
             output,
         )
     if args.command in PENDING_COMMANDS:

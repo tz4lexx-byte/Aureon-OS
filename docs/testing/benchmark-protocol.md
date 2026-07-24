@@ -11,3 +11,28 @@ Windows obtiene un resultado mejor.
 
 No se ejecuta automáticamente desde una VM ni se envía ninguna métrica fuera
 del equipo.
+
+## Harness reproducible de medición smoke
+
+`measure-smoke` orquesta repeticiones del runner `test-smoke` sin duplicar su
+construcción, aislamiento ni arranque. El modo por defecto es un plan
+determinista que no escribe ni invoca QEMU, Podman, `sudo` o red:
+
+```bash
+python3 tools/aureon-dev measure-smoke \
+  --run-id phase1-baseline \
+  --runs 3 \
+  --baseline docs/testing/phase0-review-20260724t164040z.json \
+  --dry-run
+```
+
+Una ejecución futura requiere privilegios ya adquiridos y debe solicitarse
+explícitamente con `--execute`; el comando nunca intenta elevarlos. Cada
+repetición recibe `<run-id>-rNN`, conserva un overlay copy-on-write
+independiente y se detiene en el primer fallo sin borrar la evidencia previa.
+El guest permanece sin red, directorios compartidos ni discos físicos.
+
+La evidencia real vive bajo `work/measurements/<run-id>/`: `measurement.json`
+y `measurement.md` resumen el lote, mientras `runs/rNN.json` conserva cada
+resultado completado. El JSON usa UTF-8, claves ordenadas, indentación de dos
+espacios y rutas relativas; no introduce timestamps.
