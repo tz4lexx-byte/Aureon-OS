@@ -3,6 +3,7 @@
   "version": 1,
   "base_image": "quay.io/fedora/fedora-bootc@sha256:86cd97f1e7962e30f52f35ae1c0719299df4f681492b133ea4bcdb74d154fb92",
   "profile": "desktop-preview",
+  "display_profile": "packaging/display-profile.json",
   "base_provided_required": ["kernel", "systemd", "NetworkManager", "bootc"],
   "package_resolution": {
     "lock_required_for_release": true,
@@ -17,6 +18,7 @@
     "plasma-workspace",
     "plasma-workspace-wayland",
     "kwin-wayland",
+    "libkscreen",
     "xdg-desktop-portal-kde",
     "mesa-dri-drivers",
     "pipewire",
@@ -41,5 +43,10 @@
     "anti-cheat",
     "firmware-updater",
     "telemetry-agent"
+  ],
+  "runtime_validation": [
+    "aureonctl baseline",
+    "aureonctl core doctor",
+    "aureonctl services doctor"
   ]
 }

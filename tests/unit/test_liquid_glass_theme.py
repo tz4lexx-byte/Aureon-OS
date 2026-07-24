@@ -78,6 +78,10 @@ class LiquidGlassThemeTests(unittest.TestCase):
         metadata = json.loads((self.theme_root / "metadata.json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["KPlugin"]["Id"], "AureonLiquidGlass")
         self.assertEqual(metadata["KPlugin"]["License"], "GPL-3.0-or-later")
+        look_and_feel = json.loads(
+            (OVERLAY / "usr" / "share" / "plasma" / "look-and-feel" / "org.aureon.desktop" / "metadata.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(look_and_feel["KPackageStructure"], "Plasma/LookAndFeel")
 
         for asset in (self.theme_root / "widgets" / "panel-background.svg", self.wallpaper):
             root = ET.fromstring(asset.read_text(encoding="utf-8"))
@@ -99,12 +103,11 @@ class LiquidGlassThemeTests(unittest.TestCase):
         self.assertIn("BlurStrength=6", kwin)
 
     def test_one_time_wallpaper_helper_never_uses_network_or_host_paths(self):
-        autostart = OVERLAY / "etc" / "xdg" / "autostart" / "aureon-apply-appearance.desktop"
         helper = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-apply-appearance"
-        autostart_source = autostart.read_text(encoding="utf-8")
+        readiness = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-session-ready"
         helper_source = helper.read_text(encoding="utf-8").lower()
 
-        self.assertIn("OnlyShowIn=KDE;", autostart_source)
+        self.assertIn("aureon-apply-appearance", readiness.read_text(encoding="utf-8"))
         self.assertIn("plasma-apply-wallpaperimage", helper_source)
         self.assertIn("liquid-glass-v1-applied", helper_source)
         for forbidden in ("curl", "wget", "sudo", "physicaldrive", "/mnt/c", "rm -rf"):

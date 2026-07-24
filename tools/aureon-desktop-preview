@@ -16,6 +16,8 @@ run with networking disabled.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime as dt
 import errno
 import hashlib
@@ -25,6 +27,7 @@ import platform
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -57,7 +60,15 @@ MINIMUM_BOOT_TIMEOUT = 60
 MAXIMUM_BOOT_TIMEOUT = 1800
 DEFAULT_MEMORY_MIB = 6144
 DEFAULT_VCPUS = 4
+DEFAULT_DISPLAY_WIDTH = 1920
+DEFAULT_DISPLAY_HEIGHT = 1080
+DEFAULT_DISPLAY_REFRESH_HZ = 60
+DEFAULT_VIDEO_ADAPTER = "virtio"
+DEFAULT_GTK_BACKEND = "x11"
 CONVERSION_TIMEOUT = 5400
+QMP_RUNTIME_ROOT = Path("/run/aureon-desktop-preview")
+QMP_CAPTURE_AFTER_SECONDS = 90
+QMP_CAPTURE_ATTEMPTS = 3
 
 
 class PreviewError(RuntimeError):
@@ -78,6 +89,7 @@ class PreviewPaths:
     conversion_cid: Path
     conversion_cleanup_log: Path
     oci_evidence: Path
+    package_lock: Path
     qcow2_evidence: Path
     disk: Path
     buildlog: Path
@@ -87,6 +99,9 @@ class PreviewPaths:
     overlay_log: Path
     serial_log: Path
     qemu_log: Path
+    framebuffer_probe: Path
+    framebuffer_ready: Path
+    framebuffer_evidence: Path
     preview_evidence: Path
 
 
@@ -100,6 +115,9 @@ class ExistingSessionPaths:
     overlay_log: Path
     serial_log: Path
     qemu_log: Path
+    framebuffer_probe: Path
+    framebuffer_ready: Path
+    framebuffer_evidence: Path
     evidence: Path
 
 
@@ -163,6 +181,7 @@ def preview_paths(build_id: str, repository_root: Path = ROOT) -> PreviewPaths:
         conversion_cid=build_root / "conversion.cid",
         conversion_cleanup_log=build_root / "conversion-cleanup.log",
         oci_evidence=build_root / "desktop-oci.json",
+        package_lock=build_root / "desktop-packages.lock.json",
         qcow2_evidence=build_root / "qcow2.json",
         disk=image_root / "aureon-desktop.qcow2",
         buildlog=image_root / "aureon-desktop.buildlog",
@@ -172,6 +191,9 @@ def preview_paths(build_id: str, repository_root: Path = ROOT) -> PreviewPaths:
         overlay_log=work_root / "overlay-create.log",
         serial_log=work_root / "serial.log",
         qemu_log=work_root / "qemu.log",
+        framebuffer_probe=work_root / "framebuffer-probe.ppm",
+        framebuffer_ready=work_root / "framebuffer-ready.ppm",
+        framebuffer_evidence=work_root / "framebuffer.json",
         preview_evidence=work_root / "preview.json",
     )
     for label, candidate in (
@@ -198,6 +220,9 @@ def existing_session_paths(build_id: str, session_id: str, repository_root: Path
         overlay_log=session_root / "overlay-create.log",
         serial_log=session_root / "serial.log",
         qemu_log=session_root / "qemu.log",
+        framebuffer_probe=session_root / "framebuffer-probe.ppm",
+        framebuffer_ready=session_root / "framebuffer-ready.ppm",
+        framebuffer_evidence=session_root / "framebuffer.json",
         evidence=session_root / "session.json",
     )
     for label, candidate in (
@@ -240,7 +265,18 @@ def _source_digest(root: Path) -> tuple[list[dict[str, str]], str]:
         if lexical.is_file():
             files = (lexical,)
         elif lexical.is_dir():
-            files = tuple(sorted((item for item in lexical.rglob("*") if item.is_file()), key=str))
+            files = tuple(
+                sorted(
+                    (
+                        item
+                        for item in lexical.rglob("*")
+                        if item.is_file()
+                        and "__pycache__" not in item.parts
+                        and item.suffix not in {".pyc", ".pyo"}
+                    ),
+                    key=str,
+                )
+            )
         else:
             raise PreviewError("desktop source is missing: '{0}'".format(lexical))
         for item in files:
@@ -253,11 +289,22 @@ def _source_digest(root: Path) -> tuple[list[dict[str, str]], str]:
     return records, hashlib.sha256(encoded).hexdigest()
 
 
-def create_plan(build_id: str, boot_timeout: int, acceleration: str, repository_root: Path = ROOT) -> dict:
+def create_plan(
+    build_id: str,
+    boot_timeout: int,
+    acceleration: str,
+    repository_root: Path = ROOT,
+    video: str = DEFAULT_VIDEO_ADAPTER,
+    gtk_backend: str = DEFAULT_GTK_BACKEND,
+) -> dict:
     """Create the deterministic no-write preview plan shown by default."""
 
     if acceleration not in {"auto", "kvm", "tcg"}:
         raise PreviewError("--accel must be auto, kvm, or tcg")
+    if video not in {"virtio", "std"}:
+        raise PreviewError("--video must be virtio or std")
+    if gtk_backend not in {"auto", "x11", "wayland"}:
+        raise PreviewError("--gtk-backend must be auto, x11, or wayland")
     if not MINIMUM_BOOT_TIMEOUT <= boot_timeout <= MAXIMUM_BOOT_TIMEOUT:
         raise PreviewError(
             "--boot-timeout-seconds must be between {0} and {1}".format(
@@ -287,6 +334,14 @@ def create_plan(build_id: str, boot_timeout: int, acceleration: str, repository_
             "acceleration_policy": acceleration,
             "memory_mib": DEFAULT_MEMORY_MIB,
             "vcpus": DEFAULT_VCPUS,
+            "video_adapter": video,
+            "gtk_backend": gtk_backend,
+            "requested_display": {
+                "width": DEFAULT_DISPLAY_WIDTH,
+                "height": DEFAULT_DISPLAY_HEIGHT,
+                "refresh_hz": DEFAULT_DISPLAY_REFRESH_HZ,
+                "scale": 1.0,
+            },
             "virtual_disk_size_bytes": DESKTOP_IMAGE_SIZE_BYTES,
         },
         "safety": {
@@ -298,10 +353,14 @@ def create_plan(build_id: str, boot_timeout: int, acceleration: str, repository_
         "paths": {
             "manifest": _relative(paths.manifest, root),
             "result": _relative(paths.result, root),
+            "package_inventory": _relative(paths.package_lock, root),
             "base_qcow2": _relative(paths.disk, root),
             "overlay": _relative(paths.overlay, root),
             "serial_log": _relative(paths.serial_log, root),
             "qemu_log": _relative(paths.qemu_log, root),
+            "framebuffer_probe": _relative(paths.framebuffer_probe, root),
+            "framebuffer_ready": _relative(paths.framebuffer_ready, root),
+            "framebuffer_evidence": _relative(paths.framebuffer_evidence, root),
             "preview_evidence": _relative(paths.preview_evidence, root),
         },
     }
@@ -316,6 +375,57 @@ def _write_json_once(path: Path, payload: dict) -> None:
             handle.write("\n")
     except FileExistsError as error:
         raise PreviewError("refusing to overwrite evidence '{0}'".format(path)) from error
+
+
+def _package_inventory(raw: str) -> dict:
+    """Normalize an RPM NEVRA snapshot into deterministic build evidence."""
+
+    component_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~^-]{0,255}")
+    legacy_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~^:-]{1,511}")
+    missing_values = {"", "(none)", "(null)", "none", "null"}
+    packages: set[str] = set()
+    for line_number, raw_line in enumerate(raw.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) == 5:
+            name, epoch, version, release, architecture = (field.strip() for field in fields)
+            if epoch.lower() in missing_values:
+                epoch = "0"
+            # RPM's synthetic gpg-pubkey records commonly report ARCH as
+            # ``(none)``. Keep the record deterministic without pretending it
+            # is a binary package for a real architecture.
+            if architecture.lower() in missing_values:
+                architecture = "none"
+            if version.lower() in missing_values:
+                version = "none"
+            if release.lower() in missing_values:
+                release = "none"
+            components = (name, version, release, architecture)
+            if not epoch.isdigit() or any(not component_pattern.fullmatch(value) for value in components):
+                raise PreviewError(
+                    "desktop OCI returned an invalid RPM package inventory at line "
+                    f"{line_number}: {line[:160]!r}"
+                )
+            packages.add(f"{name}-{epoch}:{version}-{release}.{architecture}")
+        elif legacy_pattern.fullmatch(line):
+            packages.add(line)
+        else:
+            raise PreviewError(
+                "desktop OCI returned an invalid RPM package inventory at line "
+                f"{line_number}: {line[:160]!r}"
+            )
+    packages = sorted(packages)
+    if not packages:
+        raise PreviewError("desktop OCI returned an invalid RPM package inventory")
+    encoded = ("\n".join(packages) + "\n").encode("utf-8")
+    return {
+        "algorithm": "sha256",
+        "count": len(packages),
+        "digest": hashlib.sha256(encoded).hexdigest(),
+        "packages": packages,
+    }
 
 
 def _environment() -> dict[str, str]:
@@ -463,6 +573,25 @@ def _preview_identity() -> tuple[int, int, str, str, tuple[int, ...]]:
     return uid, gid, user, entry.pw_dir, groups
 
 
+def _identity_can_access_device(path: Path, identity: tuple[int, int, str, str, tuple[int, ...]]) -> bool:
+    """Check device read/write bits for the unprivileged QEMU identity."""
+
+    try:
+        device = path.stat()
+    except OSError:
+        return False
+    if not stat.S_ISCHR(device.st_mode):
+        return False
+    uid, gid, _, _, groups = identity
+    if uid == device.st_uid:
+        readable, writable = stat.S_IRUSR, stat.S_IWUSR
+    elif device.st_gid == gid or device.st_gid in groups:
+        readable, writable = stat.S_IRGRP, stat.S_IWGRP
+    else:
+        readable, writable = stat.S_IROTH, stat.S_IWOTH
+    return bool(device.st_mode & readable) and bool(device.st_mode & writable)
+
+
 def _ensure_dedicated_runroot() -> None:
     """Create only the documented ephemeral Podman runroot after a WSL reboot."""
 
@@ -477,15 +606,23 @@ def _ensure_dedicated_runroot() -> None:
     _require_real_system_path(PODMAN_RUNROOT, "dedicated Podman runroot", True)
 
 
-def _gui_environment(home: str) -> dict[str, str]:
+def _gui_environment(home: str, gtk_backend: str) -> dict[str, str]:
     """Pass only WSLg display variables to the unprivileged QEMU frontend."""
 
     required = ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XAUTHORITY")
     supplied = {key: os.environ[key] for key in required if os.environ.get(key)}
     if not supplied.get("DISPLAY") and not supplied.get("WAYLAND_DISPLAY"):
         raise PreviewError("WSLg display variables are unavailable; run this from your normal Ubuntu WSL session")
+    if gtk_backend not in {"auto", "x11", "wayland"}:
+        raise PreviewError("--gtk-backend must be auto, x11, or wayland")
+    if gtk_backend == "x11" and not supplied.get("DISPLAY"):
+        raise PreviewError("the x11 GTK backend was requested but WSLg DISPLAY is unavailable")
+    if gtk_backend == "wayland" and not supplied.get("WAYLAND_DISPLAY"):
+        raise PreviewError("the Wayland GTK backend was requested but WSLg WAYLAND_DISPLAY is unavailable")
     environment = {"HOME": home, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"}
     environment.update(supplied)
+    if gtk_backend != "auto":
+        environment["GDK_BACKEND"] = gtk_backend
     return environment
 
 
@@ -500,7 +637,7 @@ def _qemu_preexec(uid: int, gid: int, groups: tuple[int, ...]):
     return drop_privileges
 
 
-def _validate_runtime_preflight(root: Path, acceleration: str) -> dict:
+def _validate_runtime_preflight(root: Path, acceleration: str, gtk_backend: str = DEFAULT_GTK_BACKEND) -> dict:
     """Inspect the WSL/QEMU prerequisites shared by build and resume paths."""
 
     if platform.system().lower() != "linux":
@@ -522,12 +659,12 @@ def _validate_runtime_preflight(root: Path, acceleration: str) -> dict:
     displays = _capture((executables["qemu"], "-display", "help"), environment, 30)
     if "gtk" not in displays.split():
         raise PreviewError("QEMU GTK display backend is missing; install qemu-system-gui inside Ubuntu WSL")
-    kvm_available = Path("/dev/kvm").exists() and os.access("/dev/kvm", os.R_OK | os.W_OK)
+    identity = _preview_identity()
+    kvm_available = _identity_can_access_device(Path("/dev/kvm"), identity)
     if acceleration == "kvm" and not kvm_available:
         raise PreviewError("KVM was requested but /dev/kvm is unavailable")
     selected_acceleration = "kvm" if acceleration == "kvm" or (acceleration == "auto" and kvm_available) else "tcg"
-    identity = _preview_identity()
-    gui_environment = _gui_environment(identity[3])
+    gui_environment = _gui_environment(identity[3], gtk_backend)
     return {
         "executables": executables,
         "environment": environment,
@@ -538,7 +675,7 @@ def _validate_runtime_preflight(root: Path, acceleration: str) -> dict:
     }
 
 
-def _validate_preflight(root: Path, acceleration: str) -> dict:
+def _validate_preflight(root: Path, acceleration: str, gtk_backend: str = DEFAULT_GTK_BACKEND) -> dict:
     """Inspect all full-build prerequisites before creating preview artifacts."""
 
     if shutil.disk_usage(root).free < MINIMUM_FREE_BYTES:
@@ -556,7 +693,7 @@ def _validate_preflight(root: Path, acceleration: str) -> dict:
         raise PreviewError("the dedicated WSL Podman storage.conf does not match the reviewed project file")
     if _hash_file(source_containers) != _hash_file(PODMAN_CONFIG / "containers.conf"):
         raise PreviewError("the dedicated WSL Podman containers.conf does not match the reviewed project file")
-    runtime = _validate_runtime_preflight(root, acceleration)
+    runtime = _validate_runtime_preflight(root, acceleration, gtk_backend)
     podman = _trusted_executable("/usr/bin/podman", "Podman")
     podman_prefix = (podman, "--root", str(PODMAN_STORE), "--runroot", str(PODMAN_RUNROOT), "--storage-driver", "overlay")
     for reference, label in ((BASE_REFERENCE, "Fedora bootc base"), (IMAGE_BUILDER_REFERENCE, "Image Builder")):
@@ -740,8 +877,231 @@ def _cleanup_conversion(
             pass
 
 
-def qemu_command(paths: PreviewPaths, qemu: str, acceleration: str) -> tuple[str, ...]:
+def _qmp_runtime_paths(paths: PreviewPaths | ExistingSessionPaths) -> tuple[Path, Path]:
+    """Return a short private runtime path; AF_UNIX paths cannot use long DrvFS names."""
+
+    token = hashlib.sha256(os.fspath(paths.qemu_log).encode("utf-8")).hexdigest()[:20]
+    directory = QMP_RUNTIME_ROOT / token
+    return directory, directory / "qmp.sock"
+
+
+def _prepare_qmp_runtime(paths: PreviewPaths | ExistingSessionPaths, uid: int, gid: int) -> tuple[Path, Path]:
+    """Create one launcher-owned QMP directory below volatile WSL /run."""
+
+    if QMP_RUNTIME_ROOT.exists():
+        _require_real_system_path(QMP_RUNTIME_ROOT, "Aureon QMP runtime root", True)
+    else:
+        _require_real_system_path(QMP_RUNTIME_ROOT.parent, "WSL runtime directory", True)
+        try:
+            QMP_RUNTIME_ROOT.mkdir(mode=0o755)
+        except OSError as error:
+            raise PreviewError("could not create the QMP runtime root: {0}".format(error)) from error
+        _require_real_system_path(QMP_RUNTIME_ROOT, "Aureon QMP runtime root", True)
+    try:
+        # Path.mkdir applies the caller's umask.  QEMU later runs as the
+        # invoking WSL user, so the reviewed root-owned parent must always be
+        # traversable even when sudo inherited a restrictive umask.
+        os.chmod(QMP_RUNTIME_ROOT, 0o755)
+    except OSError as error:
+        raise PreviewError("could not normalize the QMP runtime root: {0}".format(error)) from error
+    directory, qmp_socket = _qmp_runtime_paths(paths)
+    if directory.exists() or directory.is_symlink():
+        raise PreviewError("refusing to reuse an existing QMP runtime directory")
+    try:
+        directory.mkdir(mode=0o700)
+        os.chown(directory, uid, gid)
+        os.chmod(directory, 0o700)
+    except OSError as error:
+        raise PreviewError("could not prepare the private QMP runtime: {0}".format(error)) from error
+    return directory, qmp_socket
+
+
+def _cleanup_qmp_runtime(directory: Path, qmp_socket: Path) -> None:
+    """Remove only the exact socket and empty runtime directory created above."""
+
+    try:
+        if qmp_socket.exists() or qmp_socket.is_symlink():
+            mode = qmp_socket.lstat().st_mode
+            if not stat.S_ISSOCK(mode):
+                return
+            qmp_socket.unlink()
+        directory.rmdir()
+    except OSError:
+        # /run is volatile.  A stale exact directory is rejected on the next
+        # attempt rather than broad cleanup ever being attempted.
+        return
+
+
+def _qmp_reply(stream) -> dict:
+    """Read a bounded QMP response while ignoring asynchronous event messages."""
+
+    for _ in range(64):
+        line = stream.readline(262145)
+        if not line or len(line) > 262144:
+            raise PreviewError("QMP returned an incomplete or oversized response")
+        try:
+            message = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise PreviewError("QMP returned invalid JSON") from error
+        if isinstance(message, dict) and ("return" in message or "error" in message):
+            return message
+    raise PreviewError("QMP did not return a bounded command response")
+
+
+def _inspect_ppm(path: Path) -> dict:
+    """Inspect QEMU's P6 screendump without loading any image library."""
+
+    if path.is_symlink() or not path.is_file():
+        raise PreviewError("QMP framebuffer capture is missing or unsafe")
+    try:
+        size = path.stat().st_size
+        if size < 16 or size > 32 * 1024 * 1024:
+            raise PreviewError("QMP framebuffer capture has an unexpected size")
+        data = path.read_bytes()
+    except OSError as error:
+        raise PreviewError("QMP framebuffer capture is unreadable: {0}".format(error)) from error
+
+    position = 0
+
+    def token() -> bytes:
+        nonlocal position
+        while position < len(data):
+            if data[position] == 35:  # '#'
+                newline = data.find(b"\n", position)
+                if newline < 0:
+                    raise PreviewError("QMP PPM header has an unterminated comment")
+                position = newline + 1
+            elif chr(data[position]).isspace():
+                position += 1
+            else:
+                break
+        start = position
+        while position < len(data) and not chr(data[position]).isspace() and data[position] != 35:
+            position += 1
+        if start == position:
+            raise PreviewError("QMP PPM header is incomplete")
+        return data[start:position]
+
+    try:
+        magic = token()
+        width = int(token())
+        height = int(token())
+        maximum = int(token())
+    except (ValueError, OverflowError) as error:
+        raise PreviewError("QMP PPM header is invalid") from error
+    if magic != b"P6" or maximum != 255 or width < 1 or height < 1:
+        raise PreviewError("QMP framebuffer is not an 8-bit P6 image")
+    if position >= len(data) or not chr(data[position]).isspace():
+        raise PreviewError("QMP PPM pixel delimiter is missing")
+    if data[position:position + 2] == b"\r\n":
+        position += 2
+    else:
+        position += 1
+    expected = width * height * 3
+    pixels = memoryview(data)[position:]
+    if len(pixels) != expected:
+        raise PreviewError("QMP framebuffer pixel payload is truncated or oversized")
+    pixel_count = width * height
+    stride_pixels = max(1, pixel_count // 8192)
+    colors: set[tuple[int, int, int]] = set()
+    minimum = 255
+    maximum_channel = 0
+    for pixel_index in range(0, pixel_count, stride_pixels):
+        offset = pixel_index * 3
+        color = (pixels[offset], pixels[offset + 1], pixels[offset + 2])
+        colors.add(color)
+        minimum = min(minimum, *color)
+        maximum_channel = max(maximum_channel, *color)
+    dynamic_range = maximum_channel - minimum
+    return {
+        "algorithm": "sha256",
+        "sha256": _hash_file(path),
+        "width": width,
+        "height": height,
+        "sampled_unique_colors": len(colors),
+        "sampled_dynamic_range": dynamic_range,
+        "visually_non_uniform": len(colors) >= 8 and dynamic_range >= 16,
+    }
+
+
+def _qmp_screendump(qmp_socket: Path, output: Path) -> dict:
+    """Capture one primary framebuffer through local QMP, never TCP."""
+
+    if output.exists() or output.is_symlink():
+        raise PreviewError("refusing to overwrite a framebuffer capture")
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(10.0)
+    try:
+        connection.connect(os.fspath(qmp_socket))
+        with connection.makefile("rwb", buffering=0) as stream:
+            greeting_line = stream.readline(262145)
+            try:
+                greeting = json.loads(greeting_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise PreviewError("QMP greeting is invalid") from error
+            if not isinstance(greeting, dict) or "QMP" not in greeting:
+                raise PreviewError("QMP greeting is missing")
+            stream.write(b'{"execute":"qmp_capabilities"}\n')
+            capability_reply = _qmp_reply(stream)
+            if "error" in capability_reply:
+                raise PreviewError("QMP rejected capability negotiation")
+            request = json.dumps(
+                {"execute": "screendump", "arguments": {"filename": os.fspath(output)}},
+                separators=(",", ":"),
+            ).encode("utf-8") + b"\n"
+            stream.write(request)
+            dump_reply = _qmp_reply(stream)
+            if "error" in dump_reply:
+                raise PreviewError("QMP screendump failed: {0}".format(str(dump_reply["error"])[:200]))
+    except (OSError, socket.timeout) as error:
+        raise PreviewError("QMP framebuffer capture failed: {0}".format(error)) from error
+    finally:
+        connection.close()
+    deadline = time.monotonic() + 10
+    while not output.is_file() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return _inspect_ppm(output)
+
+
+def _capture_qmp_with_retries(qmp_socket: Path, output: Path) -> tuple[dict | None, str | None]:
+    """Retry transient QMP failures without ever overwriting a capture."""
+
+    errors: list[str] = []
+    for attempt in range(QMP_CAPTURE_ATTEMPTS):
+        try:
+            details = _qmp_screendump(qmp_socket, output)
+        except PreviewError as error:
+            errors.append(str(error))
+            # A created path may contain a completed or partial screendump.
+            # Preserve it as evidence and never remove or overwrite it here.
+            if output.exists() or output.is_symlink() or attempt + 1 == QMP_CAPTURE_ATTEMPTS:
+                break
+            time.sleep(0.25)
+            continue
+        details["path"] = output.name
+        return details, None
+    return None, " | ".join(errors)
+
+
+def qemu_command(
+    paths: PreviewPaths | ExistingSessionPaths,
+    qemu: str,
+    acceleration: str,
+    video: str = DEFAULT_VIDEO_ADAPTER,
+    qmp_socket: Path | None = None,
+) -> tuple[str, ...]:
     """Return the fixed GUI VM argv; no host disk, NIC, share, or passthrough exists."""
+
+    video_devices = {
+        "virtio": "virtio-vga,edid=on,xres={0},yres={1},max_outputs=1".format(
+            DEFAULT_DISPLAY_WIDTH, DEFAULT_DISPLAY_HEIGHT
+        ),
+        "std": "VGA,vgamem_mb=64",
+    }
+    if video not in video_devices:
+        raise PreviewError("--video must be virtio or std")
+    if qmp_socket is None:
+        _, qmp_socket = _qmp_runtime_paths(paths)
 
     return (
         qemu,
@@ -761,7 +1121,7 @@ def qemu_command(paths: PreviewPaths, qemu: str, acceleration: str) -> tuple[str
         "-drive",
         "if=virtio,format=qcow2,file={0}".format(paths.overlay),
         "-device",
-        "virtio-vga",
+        video_devices[video],
         "-device",
         "qemu-xhci,id=xhci",
         "-device",
@@ -769,11 +1129,13 @@ def qemu_command(paths: PreviewPaths, qemu: str, acceleration: str) -> tuple[str
         "-device",
         "usb-tablet,bus=xhci.0",
         "-display",
-        "gtk,gl=off",
+        "gtk,gl=off,zoom-to-fit=off,show-tabs=off",
         "-nic",
         "none",
         "-serial",
         "file:{0}".format(paths.serial_log),
+        "-qmp",
+        "unix:{0},server=on,wait=off".format(qmp_socket),
         "-monitor",
         "none",
         "-no-reboot",
@@ -786,12 +1148,24 @@ def _run_interactive_qemu(
     environment: dict[str, str],
     boot_timeout: int,
     preexec_fn,
+    qmp_socket: Path | None = None,
 ) -> dict:
     """Keep the desktop window open after its serial readiness marker appears."""
 
     started = time.monotonic()
     marker_after = None
+    failure_after = None
     timed_out = False
+    framebuffer_captures: dict[str, dict] = {}
+    framebuffer_errors: dict[str, str] = {}
+
+    def capture(label: str, output: Path) -> None:
+        details, error = _capture_qmp_with_retries(qmp_socket, output)  # type: ignore[arg-type]
+        if details is not None:
+            framebuffer_captures[label] = details
+        else:
+            framebuffer_errors[label] = error or "QMP framebuffer capture failed"
+
     try:
         with paths.qemu_log.open("xb") as handle:
             process = subprocess.Popen(
@@ -804,6 +1178,7 @@ def _run_interactive_qemu(
                 preexec_fn=preexec_fn,
             )
             while process.poll() is None:
+                elapsed = time.monotonic() - started
                 if marker_after is None and paths.serial_log.is_file():
                     try:
                         serial = paths.serial_log.read_text(encoding="utf-8", errors="replace")
@@ -816,8 +1191,25 @@ def _run_interactive_qemu(
                             raise
                     else:
                         if "AUREON_DESKTOP_READY" in serial:
-                            marker_after = round(time.monotonic() - started, 3)
-                if marker_after is None and time.monotonic() - started >= boot_timeout:
+                            marker_after = round(elapsed, 3)
+                        elif "AUREON_DESKTOP_NOT_READY" in serial:
+                            failure_after = round(elapsed, 3)
+                if qmp_socket is not None:
+                    if marker_after is not None and "ready" not in framebuffer_captures and "ready" not in framebuffer_errors:
+                        capture("ready", paths.framebuffer_ready)
+                    elif (
+                        marker_after is None
+                        and elapsed >= QMP_CAPTURE_AFTER_SECONDS
+                        and "probe" not in framebuffer_captures
+                        and "probe" not in framebuffer_errors
+                    ):
+                        capture("probe", paths.framebuffer_probe)
+                if failure_after is not None:
+                    if qmp_socket is not None and "probe" not in framebuffer_captures and "probe" not in framebuffer_errors:
+                        capture("probe", paths.framebuffer_probe)
+                    _terminate_group(process)
+                    break
+                if marker_after is None and elapsed >= boot_timeout:
                     timed_out = True
                     _terminate_group(process)
                     break
@@ -827,21 +1219,89 @@ def _run_interactive_qemu(
         raise PreviewError("refusing to overwrite QEMU log") from error
     except (OSError, subprocess.TimeoutExpired) as error:
         raise PreviewError("desktop QEMU failed: {0}".format(error)) from error
+    if qmp_socket is not None:
+        _write_json_once(
+            paths.framebuffer_evidence,
+            {
+                "schema": "aureon.qemu-framebuffer-evidence",
+                "version": 1,
+                "captures": framebuffer_captures,
+                "errors": framebuffer_errors,
+            },
+        )
     return {
         "returncode": returncode,
         "desktop_ready_after_seconds": marker_after,
+        "desktop_failure_after_seconds": failure_after,
         "boot_timeout_reached": timed_out,
         "wall_duration_seconds": round(time.monotonic() - started, 3),
+        "framebuffer": {"captures": framebuffer_captures, "errors": framebuffer_errors},
     }
 
 
-def create_existing_launch_plan(build_id: str, session_id: str, boot_timeout: int, acceleration: str) -> dict:
+def _extract_guest_evidence(serial_log: Path) -> dict[str, dict]:
+    """Decode bounded JSON reports emitted by the reviewed guest readiness probe."""
+
+    try:
+        serial = serial_log.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise PreviewError("desktop serial evidence is unreadable: {0}".format(error)) from error
+    reports: dict[str, dict] = {}
+    pattern = re.compile(r"AUREON_EVIDENCE (baseline|core|services)=([A-Za-z0-9+/=]{4,262144})")
+    for name, encoded in pattern.findall(serial):
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+            parsed = json.loads(decoded.decode("utf-8"))
+        except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise PreviewError("guest {0} evidence is invalid".format(name)) from error
+        if not isinstance(parsed, dict) or parsed.get("schema") != "aureon.control-plane-report":
+            raise PreviewError("guest {0} evidence has an unexpected schema".format(name))
+        reports[name] = parsed
+    return reports
+
+
+def _extract_guest_session_state(serial_log: Path) -> dict[str, str]:
+    """Extract the small allowlisted readiness state from the serial log."""
+
+    try:
+        serial = serial_log.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise PreviewError("desktop serial evidence is unreadable: {0}".format(error)) from error
+    state: dict[str, str] = {}
+    for key in (
+        "probe_state",
+        "session",
+        "kwin_wayland",
+        "plasmashell",
+        "appearance_state",
+        "display_requested",
+        "display_state",
+        "failure_reason",
+    ):
+        matches = re.findall(r"{0}=([A-Za-z0-9@._-]+)".format(re.escape(key)), serial)
+        if matches:
+            state[key] = matches[-1]
+    return state
+
+
+def create_existing_launch_plan(
+    build_id: str,
+    session_id: str,
+    boot_timeout: int,
+    acceleration: str,
+    video: str = DEFAULT_VIDEO_ADAPTER,
+    gtk_backend: str = DEFAULT_GTK_BACKEND,
+) -> dict:
     """Render the no-write plan for a new overlay on a preserved base image."""
 
     base = preview_paths(build_id, ROOT)
     session = existing_session_paths(build_id, session_id, ROOT)
     if acceleration not in {"auto", "kvm", "tcg"}:
         raise PreviewError("--accel must be auto, kvm, or tcg")
+    if video not in {"virtio", "std"}:
+        raise PreviewError("--video must be virtio or std")
+    if gtk_backend not in {"auto", "x11", "wayland"}:
+        raise PreviewError("--gtk-backend must be auto, x11, or wayland")
     if not MINIMUM_BOOT_TIMEOUT <= boot_timeout <= MAXIMUM_BOOT_TIMEOUT:
         raise PreviewError(
             "--boot-timeout-seconds must be between {0} and {1}".format(MINIMUM_BOOT_TIMEOUT, MAXIMUM_BOOT_TIMEOUT)
@@ -858,6 +1318,14 @@ def create_existing_launch_plan(build_id: str, session_id: str, boot_timeout: in
             "guest_network": "disabled",
             "boot_timeout_seconds": boot_timeout,
             "acceleration_policy": acceleration,
+            "video_adapter": video,
+            "gtk_backend": gtk_backend,
+            "requested_display": {
+                "width": DEFAULT_DISPLAY_WIDTH,
+                "height": DEFAULT_DISPLAY_HEIGHT,
+                "refresh_hz": DEFAULT_DISPLAY_REFRESH_HZ,
+                "scale": 1.0,
+            },
         },
         "safety": {
             "base_qcow2_reused_read_only": True,
@@ -872,6 +1340,9 @@ def create_existing_launch_plan(build_id: str, session_id: str, boot_timeout: in
             "new_overlay": _relative(session.overlay, ROOT),
             "new_serial_log": _relative(session.serial_log, ROOT),
             "new_qemu_log": _relative(session.qemu_log, ROOT),
+            "new_framebuffer_probe": _relative(session.framebuffer_probe, ROOT),
+            "new_framebuffer_ready": _relative(session.framebuffer_ready, ROOT),
+            "new_framebuffer_evidence": _relative(session.framebuffer_evidence, ROOT),
         },
     }
 
@@ -887,10 +1358,25 @@ def _validate_existing_preview(paths: PreviewPaths, qemu_img: str, environment: 
         raise PreviewError("existing desktop qcow2 evidence is missing")
     try:
         recorded = json.loads(paths.qcow2_evidence.read_text(encoding="utf-8"))
+        completed = json.loads(paths.result.read_text(encoding="utf-8"))
+        preview = json.loads(paths.preview_evidence.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise PreviewError("existing desktop qcow2 evidence is unreadable") from error
+        raise PreviewError("existing desktop is not a completed current-contract preview") from error
     if recorded.get("status") != "passed" or not isinstance(recorded.get("sha256"), str):
         raise PreviewError("existing desktop qcow2 was not recorded as a passed conversion")
+    if completed.get("status") != "passed" or preview.get("schema") != "aureon.desktop-preview-evidence":
+        raise PreviewError("existing desktop did not pass the current visual readiness contract")
+    qemu_evidence = preview.get("qemu") if isinstance(preview.get("qemu"), dict) else {}
+    guest_evidence = qemu_evidence.get("guest_evidence") if isinstance(qemu_evidence.get("guest_evidence"), dict) else {}
+    guest_session = qemu_evidence.get("guest_session") if isinstance(qemu_evidence.get("guest_session"), dict) else {}
+    framebuffer = qemu_evidence.get("framebuffer") if isinstance(qemu_evidence.get("framebuffer"), dict) else {}
+    ready_capture = framebuffer.get("captures", {}).get("ready") if isinstance(framebuffer.get("captures"), dict) else None
+    if {"baseline", "core", "services"} - set(guest_evidence):
+        raise PreviewError("existing desktop lacks current baseline/core/services evidence")
+    if guest_session.get("display_state") != "observed-1920x1080@60":
+        raise PreviewError("existing desktop lacks current Full HD runtime evidence")
+    if not isinstance(ready_capture, dict) or not ready_capture.get("visually_non_uniform"):
+        raise PreviewError("existing desktop lacks a verified non-uniform framebuffer")
     inspected = _inspect_qcow2(paths, qemu_img, environment, root)
     if inspected["sha256"] != recorded["sha256"]:
         raise PreviewError("existing base qcow2 no longer matches its recorded sha256")
@@ -929,7 +1415,11 @@ def _transfer_existing_session_to_user(session: ExistingSessionPaths, uid: int, 
 def run_existing_preview(plan: dict, base: PreviewPaths, session: ExistingSessionPaths, root: Path) -> dict:
     """Open a preserved qcow2 using a new copy-on-write session overlay only."""
 
-    preflight = _validate_runtime_preflight(root, plan["execution"]["acceleration_policy"])
+    preflight = _validate_runtime_preflight(
+        root,
+        plan["execution"]["acceleration_policy"],
+        plan["execution"].get("gtk_backend", DEFAULT_GTK_BACKEND),
+    )
     qemu = preflight["executables"]["qemu"]
     qemu_img = preflight["executables"]["qemu_img"]
     environment = preflight["environment"]
@@ -946,21 +1436,53 @@ def run_existing_preview(plan: dict, base: PreviewPaths, session: ExistingSessio
         uid, gid, _, _, groups = preflight["identity"]
         _make_base_readonly_for_preview(base)
         _transfer_existing_session_to_user(session, uid, gid)
-        command = qemu_command(session, qemu, preflight["acceleration"])
-        print("[Aureon] Abriendo el escritorio ya creado con un overlay nuevo; no se reconstruira ni modificara la imagen base.", file=sys.stderr, flush=True)
-        qemu_result = _run_interactive_qemu(
-            command,
-            session,
-            preflight["gui_environment"],
-            plan["execution"]["boot_timeout_seconds"],
-            _qemu_preexec(uid, gid, groups),
-        )
+        qmp_directory, qmp_socket = _prepare_qmp_runtime(session, uid, gid)
+        try:
+            command = qemu_command(
+                session,
+                qemu,
+                preflight["acceleration"],
+                plan["execution"].get("video_adapter", DEFAULT_VIDEO_ADAPTER),
+                qmp_socket,
+            )
+            print("[Aureon] Abriendo el escritorio ya creado con un overlay nuevo; no se reconstruira ni modificara la imagen base.", file=sys.stderr, flush=True)
+            qemu_result = _run_interactive_qemu(
+                command,
+                session,
+                preflight["gui_environment"],
+                plan["execution"]["boot_timeout_seconds"],
+                _qemu_preexec(uid, gid, groups),
+                qmp_socket,
+            )
+        finally:
+            _cleanup_qmp_runtime(qmp_directory, qmp_socket)
         if qemu_result["boot_timeout_reached"]:
             raise PreviewError("existing desktop did not emit its readiness marker before the configured boot timeout")
+        if qemu_result["desktop_failure_after_seconds"] is not None:
+            failed_state = _extract_guest_session_state(session.serial_log)
+            raise PreviewError(
+                "existing guest desktop reported a readiness failure: {0}; inspect serial and framebuffer evidence".format(
+                    failed_state.get("failure_reason", "unknown")
+                )
+            )
         if qemu_result["returncode"] != 0:
             raise PreviewError("existing desktop QEMU exited {0}; inspect its preserved log".format(qemu_result["returncode"]))
         if qemu_result["desktop_ready_after_seconds"] is None:
             raise PreviewError("existing desktop QEMU exited without the readiness marker")
+        guest_evidence = _extract_guest_evidence(session.serial_log)
+        guest_session = _extract_guest_session_state(session.serial_log)
+        missing_guest_evidence = sorted({"baseline", "core", "services"} - set(guest_evidence))
+        if missing_guest_evidence:
+            raise PreviewError(
+                "existing desktop lacks current guest evidence: {0}".format(", ".join(missing_guest_evidence))
+            )
+        if guest_session.get("display_state") != "observed-1920x1080@60":
+            raise PreviewError("existing desktop did not verify the requested 1920x1080@60 guest mode")
+        ready_framebuffer = qemu_result["framebuffer"]["captures"].get("ready")
+        if not ready_framebuffer or not ready_framebuffer.get("visually_non_uniform"):
+            raise PreviewError("existing desktop did not produce a non-uniform ready framebuffer")
+        if (ready_framebuffer.get("width"), ready_framebuffer.get("height")) != (1920, 1080):
+            raise PreviewError("existing desktop framebuffer is not 1920x1080")
         base_hash_after = _hash_file(base.disk)
         if base_hash_after != inspected["sha256"]:
             raise PreviewError("the preserved base qcow2 changed; refusing to report a usable session")
@@ -972,6 +1494,15 @@ def run_existing_preview(plan: dict, base: PreviewPaths, session: ExistingSessio
             "desktop_ready_after_seconds": qemu_result["desktop_ready_after_seconds"],
             "wall_duration_seconds": qemu_result["wall_duration_seconds"],
             "guest_network": "disabled",
+            "guest_evidence": guest_evidence,
+            "guest_session": guest_session,
+            "framebuffer": qemu_result["framebuffer"],
+            "qemu": {
+                "arguments": list(command[1:]),
+                "video_adapter": plan["execution"].get("video_adapter", DEFAULT_VIDEO_ADAPTER),
+                "gtk_backend": plan["execution"].get("gtk_backend", DEFAULT_GTK_BACKEND),
+                "requested_display": plan["execution"].get("requested_display"),
+            },
             "base_qcow2_sha256_before_and_after": base_hash_after,
             "overlay_integrity_check": overlay_check or "qemu-img check exited 0",
             "artifacts": {
@@ -979,6 +1510,7 @@ def run_existing_preview(plan: dict, base: PreviewPaths, session: ExistingSessio
                 "overlay": _relative(session.overlay, root),
                 "serial_log": _relative(session.serial_log, root),
                 "qemu_log": _relative(session.qemu_log, root),
+                "framebuffer_evidence": _relative(session.framebuffer_evidence, root),
             },
         }
         _write_json_once(session.evidence, result)
@@ -1005,7 +1537,11 @@ def _utc_now() -> str:
 def execute(plan: dict, paths: PreviewPaths, root: Path) -> dict:
     """Build the reviewed desktop image, then open its isolated QEMU window."""
 
-    preflight = _validate_preflight(root, plan["execution"]["acceleration_policy"])
+    preflight = _validate_preflight(
+        root,
+        plan["execution"]["acceleration_policy"],
+        plan["execution"].get("gtk_backend", DEFAULT_GTK_BACKEND),
+    )
     _require_unused_roots(paths, root)
     expected_sources = plan["inputs"]["source_digest"]
     if _source_digest(root)[1] != expected_sources:
@@ -1066,6 +1602,34 @@ def execute(plan: dict, paths: PreviewPaths, root: Path) -> dict:
                 "source_digest": expected_sources,
                 "stage": build,
                 "status": "passed",
+            },
+        )
+        package_query = _capture(
+            podman_prefix
+            + (
+                "run",
+                "--rm",
+                "--pull=never",
+                "--network=none",
+                "--entrypoint",
+                "/usr/bin/rpm",
+                immutable,
+                "-qa",
+                "--qf",
+                "%{NAME}\\t%{EPOCH}\\t%{VERSION}\\t%{RELEASE}\\t%{ARCH}\\n",
+            ),
+            environment,
+            180,
+        )
+        _write_json_once(
+            paths.package_lock,
+            {
+                "schema": "aureon.desktop-package-inventory",
+                "version": 1,
+                "build_id": plan["build_id"],
+                "source_oci": immutable,
+                "network": "disabled",
+                **_package_inventory(package_query),
             },
         )
         installed_storage = PODMAN_CONFIG / "storage.conf"
@@ -1148,26 +1712,62 @@ def execute(plan: dict, paths: PreviewPaths, root: Path) -> dict:
         uid, gid, _, _, groups = preflight["identity"]
         _make_base_readonly_for_preview(paths)
         _transfer_work_to_user(paths, uid, gid)
-        command = qemu_command(paths, qemu, preflight["acceleration"])
-        print("[Aureon] Abriendo la ventana del escritorio KDE. Apágala desde el menú cuando termines.", file=sys.stderr, flush=True)
-        qemu_result = _run_interactive_qemu(
-            command,
+        qmp_directory, qmp_socket = _prepare_qmp_runtime(paths, uid, gid)
+        command = qemu_command(
             paths,
-            preflight["gui_environment"],
-            plan["execution"]["boot_timeout_seconds"],
-            _qemu_preexec(uid, gid, groups),
+            qemu,
+            preflight["acceleration"],
+            plan["execution"].get("video_adapter", DEFAULT_VIDEO_ADAPTER),
+            qmp_socket,
         )
+        print("[Aureon] Abriendo la ventana del escritorio KDE. Apágala desde el menú cuando termines.", file=sys.stderr, flush=True)
+        try:
+            qemu_result = _run_interactive_qemu(
+                command,
+                paths,
+                preflight["gui_environment"],
+                plan["execution"]["boot_timeout_seconds"],
+                _qemu_preexec(uid, gid, groups),
+                qmp_socket,
+            )
+        finally:
+            _cleanup_qmp_runtime(qmp_directory, qmp_socket)
         if qemu_result["boot_timeout_reached"]:
             raise PreviewError("desktop did not emit its readiness marker before the configured boot timeout")
+        if qemu_result["desktop_failure_after_seconds"] is not None:
+            failed_state = _extract_guest_session_state(paths.serial_log)
+            raise PreviewError(
+                "guest desktop reported a readiness failure: {0}; inspect serial and framebuffer evidence".format(
+                    failed_state.get("failure_reason", "unknown")
+                )
+            )
         if qemu_result["returncode"] != 0:
             raise PreviewError("QEMU exited {0}; inspect its preserved log".format(qemu_result["returncode"]))
         if qemu_result["desktop_ready_after_seconds"] is None:
             raise PreviewError("desktop QEMU exited without the readiness marker")
+        guest_evidence = _extract_guest_evidence(paths.serial_log)
+        guest_session = _extract_guest_session_state(paths.serial_log)
+        missing_guest_evidence = sorted({"baseline", "core", "services"} - set(guest_evidence))
+        if missing_guest_evidence:
+            raise PreviewError(
+                "desktop readiness did not provide required guest evidence: {0}".format(
+                    ", ".join(missing_guest_evidence)
+                )
+            )
+        if guest_session.get("display_state") != "observed-1920x1080@60":
+            raise PreviewError("desktop readiness did not verify the requested 1920x1080@60 guest mode")
+        ready_framebuffer = qemu_result["framebuffer"]["captures"].get("ready")
+        if not ready_framebuffer or not ready_framebuffer.get("visually_non_uniform"):
+            raise PreviewError("desktop readiness did not produce a non-uniform framebuffer capture")
+        if (ready_framebuffer.get("width"), ready_framebuffer.get("height")) != (1920, 1080):
+            raise PreviewError("desktop ready framebuffer is not 1920x1080")
         base_hash_after = _hash_file(paths.disk)
         if base_hash_before != base_hash_after:
             raise PreviewError("the base desktop qcow2 changed; refusing to report a usable preview")
         overlay_check = _capture((qemu_img, "check", str(paths.overlay)), environment, 180).strip()
         preview = {
+            "schema": "aureon.desktop-preview-evidence",
+            "version": 1,
             "build_id": plan["build_id"],
             "status": "passed",
             "desktop_ready_after_seconds": qemu_result["desktop_ready_after_seconds"],
@@ -1181,12 +1781,21 @@ def execute(plan: dict, paths: PreviewPaths, root: Path) -> dict:
                 "base_qcow2_sha256_before_and_after": base_hash_after,
                 "overlay_integrity_check": overlay_check or "qemu-img check exited 0",
                 "display": "gtk,gl=off via WSLg",
+                "video_adapter": plan["execution"].get("video_adapter", DEFAULT_VIDEO_ADAPTER),
+                "gtk_backend": plan["execution"].get("gtk_backend", DEFAULT_GTK_BACKEND),
+                "requested_display": plan["execution"].get("requested_display"),
+                "guest_evidence": guest_evidence,
+                "guest_session": guest_session,
+                "framebuffer": qemu_result["framebuffer"],
             },
             "artifacts": {
                 "base_qcow2": _relative(paths.disk, root),
+                "package_inventory": _relative(paths.package_lock, root),
                 "overlay": _relative(paths.overlay, root),
                 "serial_log": _relative(paths.serial_log, root),
                 "qemu_log": _relative(paths.qemu_log, root),
+                "framebuffer_evidence": _relative(paths.framebuffer_evidence, root),
+                "framebuffer_ready": _relative(paths.framebuffer_ready, root),
             },
         }
         _write_json_once(paths.preview_evidence, preview)
@@ -1237,6 +1846,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum seconds to wait for the desktop marker before the window is stopped",
     )
     parser.add_argument("--accel", choices=("auto", "kvm", "tcg"), default="auto")
+    parser.add_argument(
+        "--video",
+        choices=("virtio", "std"),
+        default=DEFAULT_VIDEO_ADAPTER,
+        help="virtual video adapter; virtio is the default and std is a compatibility fallback",
+    )
+    parser.add_argument(
+        "--gtk-backend",
+        choices=("auto", "x11", "wayland"),
+        default=DEFAULT_GTK_BACKEND,
+        help="WSLg GTK frontend; x11 avoids blank GTK/Wayland windows on affected systems",
+    )
     return parser
 
 
@@ -1253,10 +1874,17 @@ def main(argv: list[str] | None = None, output=None) -> int:
         paths = preview_paths(build_id, ROOT)
         if args.run_existing:
             session = existing_session_paths(build_id, args.session_id, ROOT)
-            plan = create_existing_launch_plan(build_id, args.session_id, args.boot_timeout_seconds, args.accel)
+            plan = create_existing_launch_plan(
+                build_id,
+                args.session_id,
+                args.boot_timeout_seconds,
+                args.accel,
+                args.video,
+                args.gtk_backend,
+            )
         else:
             session = None
-            plan = create_plan(build_id, args.boot_timeout_seconds, args.accel, ROOT)
+            plan = create_plan(build_id, args.boot_timeout_seconds, args.accel, ROOT, args.video, args.gtk_backend)
     except PreviewError as error:
         print("{0}: rejected: {1}".format(PROGRAM, error), file=output)
         return 4

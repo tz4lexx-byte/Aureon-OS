@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -22,12 +23,18 @@ SCRIPT = (
 class AureonBaselineTests(unittest.TestCase):
     maxDiff = None
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.bash = shutil.which("bash")
+
     def test_script_exists(self) -> None:
         self.assertTrue(SCRIPT.is_file(), f"No existe: {SCRIPT}")
 
     def test_bash_syntax(self) -> None:
+        if self.bash is None:
+            self.skipTest("bash syntax validation runs inside the Ubuntu WSL builder")
         result = subprocess.run(
-            ["bash", "-n", str(SCRIPT)],
+            [self.bash, "-n", str(SCRIPT)],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -42,8 +49,10 @@ class AureonBaselineTests(unittest.TestCase):
         )
 
     def test_report_contract(self) -> None:
+        if self.bash is None:
+            self.skipTest("baseline runtime validation runs inside the Ubuntu WSL builder")
         result = subprocess.run(
-            ["bash", str(SCRIPT)],
+            [self.bash, str(SCRIPT)],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -74,6 +83,15 @@ class AureonBaselineTests(unittest.TestCase):
             "memory_available_mib",
             "memory_used_estimated_mib",
             "process_count",
+            "cpu_logical",
+            "load_average_1m",
+            "load_average_5m",
+            "load_average_15m",
+            "cpu_busy_percent_1s",
+            "network_rx_bytes_1s",
+            "network_tx_bytes_1s",
+            "disk_read_bytes_1s",
+            "disk_write_bytes_1s",
             "running_services",
             "failed_units",
             "root_used_mib",
@@ -84,6 +102,8 @@ class AureonBaselineTests(unittest.TestCase):
             "ntsync_module",
             "selinux",
             "vulkaninfo",
+            "boot_error_entries",
+            "maximum_temperature_millicelsius",
         }
 
         found_keys = {

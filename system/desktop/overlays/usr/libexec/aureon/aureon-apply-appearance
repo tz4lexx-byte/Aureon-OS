@@ -1,8 +1,9 @@
 #!/bin/sh
 # Apply the Liquid Glass wallpaper one time in the disposable preview session.
 # The system look-and-feel/color scheme is already supplied by /etc/skel.  This
-# helper only supplies the initial wallpaper after Plasma's DBus session exists,
-# then leaves future choices entirely to the user.
+# helper waits for Plasma to be ready, then uses its wallpaper helper or (on
+# newer Plasma installations) its DBus API.  Future choices remain entirely in
+# the user's control.
 set -eu
 
 if [ "$(id -un)" != "aureon" ]; then
@@ -17,9 +18,49 @@ if [ -e "$marker" ] || [ ! -r "$wallpaper" ]; then
     exit 0
 fi
 
+attempt=0
+while [ "$attempt" -lt 20 ]; do
+    if pgrep -x plasmashell >/dev/null 2>&1; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+
+plasma-apply-lookandfeel --apply org.aureon.desktop
+
+applied=false
 if command -v plasma-apply-wallpaperimage >/dev/null 2>&1; then
     if plasma-apply-wallpaperimage "$wallpaper"; then
-        mkdir -p "${config_home}/aureon"
-        : > "$marker"
+        applied=true
     fi
+fi
+
+# Fedora's Plasma 6 setup may not ship plasma-apply-wallpaperimage.  Set the
+# image through the public PlasmaShell scripting interface in that case.
+if [ "$applied" = false ]; then
+    dbus_tool=""
+    if command -v qdbus6 >/dev/null 2>&1; then
+        dbus_tool="qdbus6"
+    elif command -v qdbus-qt6 >/dev/null 2>&1; then
+        dbus_tool="qdbus-qt6"
+    elif command -v qdbus >/dev/null 2>&1; then
+        dbus_tool="qdbus"
+    fi
+    if [ -n "$dbus_tool" ]; then
+        plasma_script='var ds=desktops();for(var i=0;i<ds.length;i++){ds[i].wallpaperPlugin="org.kde.image";ds[i].currentConfigGroup=["Wallpaper","org.kde.image","General"];ds[i].writeConfig("Image","file:///usr/share/wallpapers/AureonLiquidGlass/contents/images/1920x1080.svg");}'
+        if "$dbus_tool" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "$plasma_script"; then
+            applied=true
+        fi
+    elif command -v busctl >/dev/null 2>&1; then
+        plasma_script='var ds=desktops();for(var i=0;i<ds.length;i++){ds[i].wallpaperPlugin="org.kde.image";ds[i].currentConfigGroup=["Wallpaper","org.kde.image","General"];ds[i].writeConfig("Image","file:///usr/share/wallpapers/AureonLiquidGlass/contents/images/1920x1080.svg");}'
+        if busctl --user call org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell evaluateScript s "$plasma_script" >/dev/null; then
+            applied=true
+        fi
+    fi
+fi
+
+if [ "$applied" = true ]; then
+    mkdir -p "${config_home}/aureon"
+    : > "$marker"
 fi

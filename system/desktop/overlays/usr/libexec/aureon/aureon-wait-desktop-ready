@@ -1,0 +1,62 @@
+#!/bin/sh
+# System-side bridge from the Plasma session probe to serial evidence.
+set -u
+
+state_dir="/run/user/1000/aureon"
+state_file="${state_dir}/session-state"
+ready_file="${state_dir}/session-ready"
+attempt=0
+
+emit_diagnostics() {
+    printf 'AUREON_DESKTOP_DIAGNOSTICS_BEGIN\n' >&2
+    if [ -r "${state_dir}/launcher-state" ]; then
+        sed 's/^/launcher: /' "${state_dir}/launcher-state" >&2
+    else
+        printf 'launcher: state-unavailable\n' >&2
+    fi
+    if [ -r "$state_file" ]; then
+        cat "$state_file" >&2
+    else
+        printf 'probe_state=state-unavailable\n' >&2
+    fi
+    printf 'processes:\n' >&2
+    ps -u 1000 -o pid=,ppid=,stat=,comm=,args= 2>&1 | head -n 80 | sed 's/^/  /' >&2 || true
+    printf 'user-failed-units:\n' >&2
+    XDG_RUNTIME_DIR=/run/user/1000 \
+        DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
+        systemctl --user --no-pager --plain --failed 2>&1 | head -n 80 | sed 's/^/  /' >&2 || true
+    printf 'user-journal-tail:\n' >&2
+    XDG_RUNTIME_DIR=/run/user/1000 \
+        DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
+        journalctl --user -b --no-pager -n 120 -o short-monotonic 2>&1 | sed 's/^/  /' >&2 || true
+    printf 'AUREON_DESKTOP_DIAGNOSTICS_END\n' >&2
+}
+
+while [ "$attempt" -lt 240 ]; do
+    if [ -f "$ready_file" ] && [ -r "$state_file" ]; then
+        cat "$state_file"
+        for report in baseline core services; do
+            report_file="${state_dir}/${report}.json"
+            if [ ! -r "$report_file" ]; then
+                printf 'AUREON_DESKTOP_EVIDENCE_MISSING=%s\n' "$report" >&2
+                emit_diagnostics
+                exit 1
+            fi
+            encoded="$(base64 -w 0 < "$report_file")"
+            printf 'AUREON_EVIDENCE %s=%s\n' "$report" "$encoded"
+        done
+        printf 'AUREON_DESKTOP_READY\n'
+        exit 0
+    fi
+    if [ -r "$state_file" ] && grep -q '^probe_state=failed$' "$state_file"; then
+        emit_diagnostics
+        printf 'AUREON_DESKTOP_NOT_READY\n' >&2
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+
+emit_diagnostics
+printf 'AUREON_DESKTOP_NOT_READY\n' >&2
+exit 1

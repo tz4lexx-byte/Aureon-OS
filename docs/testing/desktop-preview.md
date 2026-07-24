@@ -1,90 +1,63 @@
 # Escritorio de prueba Aureon
 
-Esta es una vista previa interactiva de KDE Plasma dentro de una VM QEMU. No
-es una instalación de Aureon en el equipo: Windows sigue siendo el sistema de
-arranque y no se modifica el BIOS, el bootloader, particiones ni discos
-físicos.
+Esta es una preview de KDE Plasma dentro de una VM QEMU. No instala Aureon en
+el PC: Windows conserva el arranque y el launcher no modifica BIOS, bootloader,
+particiones ni discos físicos.
 
-## Qué crea
+## Aislamiento
 
-Al ejecutarse con un `build-id` nuevo, el lanzador solo crea estos artefactos
-del proyecto:
+Cada build crea únicamente artefactos bajo el checkout:
 
 ```text
 build/desktop-<id>/
 images/desktop-<id>/aureon-desktop.qcow2
-work/qemu-desktop/<id>/desktop-overlay.qcow2
+work/qemu-desktop/<id>/
 ```
 
-El archivo `aureon-desktop.qcow2` queda de solo lectura para la ventana QEMU.
-Todo cambio de la sesión se escribe en `desktop-overlay.qcow2`, por lo que no
-afecta ni Windows ni la imagen base. La VM no recibe NIC, carpetas compartidas,
-passthrough USB ni rutas de disco físico.
+El `qcow2` base queda de solo lectura y cada apertura utiliza un overlay nuevo.
+La VM no recibe NIC, carpetas compartidas, USB físico ni rutas de discos del
+host.
 
-## Primera ejecución
+## Próxima validación del lote 2–6
 
-La primera ejecución descarga los paquetes Fedora de KDE dentro del store
-dedicado de Podman **en Ubuntu WSL**. Por ello exige
-`--allow-build-network`; solo esa etapa de preparación usa red. La conversión
-del disco y la VM permanecen sin red. Necesita aproximadamente 35 GiB libres
-en el disco donde está el checkout y puede tardar bastante la primera vez.
-
-Desde PowerShell, pega esta orden completa:
+Las previews existentes no incorporan el nuevo marcador de sesión ni la
+comprobación Full HD. Cuando se decida probar el lote completo, se construirá
+un ID nuevo, por ejemplo `preview-14`:
 
 ```powershell
-wsl.exe -d Ubuntu-24.04 --cd /mnt/c/Users/pc/Documents/Codex/2026-07-18/aureon-os -- bash -lc 'sudo -E /usr/bin/python3 tools/aureon-desktop-preview --build-id preview-01 --execute --allow-build-network'
+wsl.exe -d Ubuntu-24.04 --cd /mnt/c/Users/pc/Documents/Codex/2026-07-18/aureon-os -- bash -lc 'sudo -E /usr/bin/python3 tools/aureon-desktop-preview --build-id preview-14 --video virtio --gtk-backend x11 --execute --allow-build-network'
 ```
 
-`sudo` pedirá la contraseña que creaste para **Ubuntu/WSL**, no la contraseña
-ni el PIN de Windows. Cuando termine de crear la imagen aparecerá una ventana
-de QEMU con el escritorio. Puedes usarla normalmente y apagarla desde el menú
-de Plasma; la orden termina al cerrarse la VM.
+`sudo` pide la contraseña del usuario Ubuntu/WSL, no el PIN ni la contraseña de
+Windows. El build necesita aproximadamente 35 GiB libres. La red se permite
+solo durante la descarga explícita de paquetes Fedora; la conversión y el guest
+permanecen sin red.
 
-Antes, si quieres comprobar que no escribe nada, usa:
+La preview solicita `1920x1080@60`, escala 1 y `virtio-vga` con EDID. El kernel
+ya no fuerza `video=Virtual-1`: `preview-13` demostró que Virtio rechazaba ese
+modo. KScreen selecciona y vuelve a observar el modo desde JSON. Plasma se
+inicia con el wrapper D-Bus oficial incluido por Fedora, y QEMU conserva una
+captura interna PPM mediante QMP local. Esto permite distinguir un framebuffer
+guest correcto de un fallo de presentación GTK/WSLg.
+
+## Abrir una imagen validada sin reconstruir
+
+Usa siempre un session ID nuevo:
 
 ```powershell
-wsl.exe -d Ubuntu-24.04 --cd /mnt/c/Users/pc/Documents/Codex/2026-07-18/aureon-os -- /usr/bin/python3 tools/aureon-desktop-preview --build-id preview-01 --dry-run
+wsl.exe -d Ubuntu-24.04 --cd /mnt/c/Users/pc/Documents/Codex/2026-07-18/aureon-os -- bash -lc 'sudo -E /usr/bin/python3 tools/aureon-desktop-preview --run-existing --build-id preview-14 --session-id usable-01 --execute'
 ```
 
-Si el backend gráfico no está disponible, instala dentro de Ubuntu WSL el
-paquete `qemu-system-gui` y vuelve a ejecutar la orden. No hace falta tocar el
-BIOS ni instalar un sistema operativo en el disco del PC.
+`--run-existing` solo acepta una base que ya haya superado el contrato visual
+actual; por eso rechaza `preview-10` y cualquier build fallida. No añadas
+`--allow-build-network`: esa ruta nunca descarga ni recompila. Para comparar la tarjeta clásica puede añadirse `--video std`;
+para comparar el frontend anterior, `--gtk-backend wayland`.
 
-## Abrir una preview ya creada, sin recompilar
+## Evidencia y límites
 
-Si ya existe una conversión validada, por ejemplo `preview-09`, no hace falta
-volver a descargar paquetes ni crear otro disco base. Esta orden genera solo
-un overlay virtual nuevo para esa sesión y abre la ventana:
+Una build nueva conserva inventario RPM, hashes, logs, parámetros gráficos y
+los informes JSON `baseline`, `core` y `services` emitidos por el guest. Consulta
+[`phase-2-6-validation.md`](phase-2-6-validation.md) para la puerta completa.
 
-```powershell
-wsl.exe -d Ubuntu-24.04 --cd /mnt/c/Users/pc/Documents/Codex/2026-07-18/aureon-os -- bash -lc 'sudo -E /usr/bin/python3 tools/aureon-desktop-preview --run-existing --build-id preview-09 --session-id aur-01 --execute'
-```
-
-No uses `--allow-build-network` con `--run-existing`: no descarga ni construye
-nada. Para otra sesión cambia únicamente `--session-id`, por ejemplo
-`aur-02`. La imagen base queda de solo lectura y el estado de la sesión vive
-en `work/qemu-desktop/preview-09/sessions/aur-01/`.
-
-## Ver el nuevo tema Liquid Glass
-
-Las imágenes ya creadas no se modifican. Para incluir el tema Liquid Glass,
-los diagnósticos locales y sus assets SVG en una nueva imagen, usa un ID nuevo
-cuando tengas al menos 35 GiB libres:
-
-```powershell
-wsl.exe -d Ubuntu-24.04 --cd /mnt/c/Users/pc/Documents/Codex/2026-07-18/aureon-os -- bash -lc 'sudo -E /usr/bin/python3 tools/aureon-desktop-preview --build-id preview-10 --execute --allow-build-network'
-```
-
-La red solo se usa durante la descarga de paquetes Fedora del build. La nueva
-VM seguirá sin red, sin carpetas compartidas y sin acceso a discos físicos.
-
-## Límites de esta fase
-
-- Es una preview de desarrollo, no una versión para instalar en hardware real.
-- El usuario `aureon` es desechable y solo existe dentro de la VM; no hay SSH,
-  contraseña de usuario ni acceso a tus archivos de Windows.
-- La aceleración gráfica usa `virtio-vga` en modo software (`gl=off`) a través
-  de WSLg. Es útil para ver y usar el escritorio, no para medir rendimiento de
-  GPU.
-- Conserva los artefactos si algo falla; no borra automáticamente ejecuciones
-  anteriores. Para reintentar, usa otro `build-id`, por ejemplo `preview-02`.
+Sigue siendo una preview de desarrollo con renderizado por software (`gl=off`),
+no una medición de GPU ni una imagen apta para instalar en hardware real.

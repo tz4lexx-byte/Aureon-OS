@@ -1,0 +1,105 @@
+#!/usr/bin/python3
+"""Select and verify Aureon's disposable 1920x1080@60 KScreen mode."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+
+
+EXPECTED_WIDTH = 1920
+EXPECTED_HEIGHT = 1080
+MINIMUM_REFRESH = 59.0
+MAXIMUM_REFRESH = 61.0
+SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _identifier(value: object) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    rendered = str(value)
+    return rendered if SAFE_ID.fullmatch(rendered) else None
+
+
+def _active_outputs(payload: dict) -> list[dict]:
+    outputs = payload.get("outputs")
+    if not isinstance(outputs, list):
+        return []
+    active = [item for item in outputs if isinstance(item, dict) and item.get("connected") is True and item.get("enabled") is True]
+    return sorted(active, key=lambda item: (item.get("priority") != 1, str(item.get("id", ""))))
+
+
+def _target_mode(output: dict) -> dict | None:
+    modes = output.get("modes")
+    if not isinstance(modes, list):
+        return None
+    candidates = []
+    for mode in modes:
+        if not isinstance(mode, dict) or not isinstance(mode.get("size"), dict):
+            continue
+        size = mode["size"]
+        refresh = mode.get("refreshRate")
+        if size.get("width") == EXPECTED_WIDTH and size.get("height") == EXPECTED_HEIGHT:
+            try:
+                numeric_refresh = float(refresh)
+            except (TypeError, ValueError):
+                continue
+            if MINIMUM_REFRESH <= numeric_refresh <= MAXIMUM_REFRESH:
+                candidates.append((abs(numeric_refresh - 60.0), mode))
+    return min(candidates, key=lambda candidate: candidate[0])[1] if candidates else None
+
+
+def inspect(payload: dict) -> dict:
+    outputs = _active_outputs(payload)
+    if not outputs:
+        return {"state": "no-active-output"}
+    output = outputs[0]
+    output_id = _identifier(output.get("id"))
+    mode = _target_mode(output)
+    if output_id is None or mode is None:
+        return {"state": "full-hd-mode-unavailable", "output": output.get("name", "unknown")}
+    mode_id = _identifier(mode.get("id"))
+    if mode_id is None:
+        return {"state": "unsafe-mode-id", "output": output.get("name", "unknown")}
+    current_mode_id = _identifier(output.get("currentModeId"))
+    try:
+        scale = float(output.get("scale", 0))
+        refresh = float(mode.get("refreshRate"))
+    except (TypeError, ValueError):
+        return {"state": "invalid-output-values", "output": output.get("name", "unknown")}
+    observed = current_mode_id == mode_id and abs(scale - 1.0) <= 0.01
+    return {
+        "state": "observed-1920x1080@60" if observed else "mode-available-not-active",
+        "output": output.get("name", "unknown"),
+        "output_id": output_id,
+        "mode_id": mode_id,
+        "width": EXPECTED_WIDTH,
+        "height": EXPECTED_HEIGHT,
+        "refresh_hz": refresh,
+        "scale": scale,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=("select", "observe"))
+    arguments = parser.parse_args(argv)
+    try:
+        payload = json.load(sys.stdin)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        print(json.dumps({"state": "invalid-kscreen-json"}, sort_keys=True))
+        return 1
+    result = inspect(payload)
+    if arguments.command == "select":
+        if result.get("state") not in {"observed-1920x1080@60", "mode-available-not-active"}:
+            return 1
+        print(result["output_id"], result["mode_id"])
+        return 0
+    print(json.dumps(result, ensure_ascii=True, sort_keys=True))
+    return 0 if result.get("state") == "observed-1920x1080@60" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

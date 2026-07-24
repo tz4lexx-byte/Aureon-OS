@@ -16,5 +16,10 @@
     "A session-only service must not be enabled at boot.",
     "A service that needs a microphone, camera, network export or firmware write requires a separate user action.",
     "The resource planner may defer work; it never terminates an interactive process."
-  ]
+  ],
+  "runtime_audit_units": {
+    "gaming": ["gamemoded.service", "aureon-gaming.service", "gamescope-session.service"],
+    "streaming": ["aureon-streaming.service", "obs-studio.service"],
+    "competitive": ["aureon-integrity.service"]
+  }
 }

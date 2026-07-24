@@ -64,6 +64,38 @@ class AureonControlPlaneTests(unittest.TestCase):
         self.assertEqual(report["result"]["state"], "passed")
         self.assertEqual(report["result"]["errors"], [])
 
+    def test_reproducibility_reports_generated_inputs_as_excluded(self):
+        status, report = self.invoke(["reproducibility"])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(report["result"]["state"], "foundation-passed")
+        self.assertTrue(report["result"]["base_image_pinned_by_digest"])
+        self.assertTrue(report["result"]["generated_inputs_excluded"])
+        self.assertFalse(report["result"]["writes_performed"])
+
+    def test_core_doctor_detects_a_minimal_package_surface(self):
+        required = {"state": "available", "installed": list(self.control.CORE_PACKAGES), "missing": []}
+        prohibited = {"state": "available", "installed": [], "missing": list(self.control.PROHIBITED_AUTOMATIC_PACKAGES)}
+        with mock.patch.object(self.control, "_query_rpm_packages", side_effect=(required, prohibited)):
+            status, report = self.invoke(["core", "doctor"])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(report["result"]["state"], "passed")
+        self.assertEqual(report["result"]["required_missing"], [])
+        self.assertEqual(report["result"]["optional_components_found_in_core"], [])
+
+    def test_services_doctor_rejects_an_active_session_only_unit(self):
+        unit_count = sum(len(group) for group in self.control.SESSION_ONLY_UNITS.values())
+        active = {"state": "failed", "stdout": "active\n" + "inactive\n" * (unit_count - 1)}
+        disabled = {"state": "failed", "stdout": "disabled\n" * unit_count}
+        with mock.patch.object(self.control, "_safe_command", side_effect=(active, disabled)):
+            status, report = self.invoke(["services", "doctor"])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(report["result"]["state"], "failed")
+        self.assertTrue(report["result"]["violations"])
+        self.assertFalse(report["result"]["process_list_observed"])
+
     def test_session_plans_never_execute_programs_or_access_devices(self):
         with mock.patch.object(self.control, "_safe_command", side_effect=AssertionError("unexpected inspection")):
             gaming_status, gaming = self.invoke(["gaming", "plan", "--game", "Example Game"])
@@ -88,6 +120,20 @@ class AureonControlPlaneTests(unittest.TestCase):
         self.assertTrue(all(action["authority"] in {"A", "B", "C", "D"} for action in catalog["actions"].values()))
         self.assertEqual(catalog["privacy"]["telemetry"], "disabled")
         self.assertEqual(catalog["privacy"]["persistent_hardware_identifier"], "forbidden")
+        self.assertEqual(
+            {phase["id"]: phase["state"] for phase in catalog["phases"]},
+            self.control.PHASE_STATES,
+        )
+
+    def test_embedded_core_and_service_catalogues_match_reviewed_sources(self):
+        profile = json.loads((ROOT / "packaging" / "desktop-profile.json").read_text(encoding="utf-8"))
+        services = json.loads((ROOT / "packaging" / "service-classes.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(set(self.control.CORE_PACKAGES), set(profile["core_packages"]))
+        self.assertEqual(
+            {name: list(units) for name, units in self.control.SESSION_ONLY_UNITS.items()},
+            services["runtime_audit_units"],
+        )
 
     def test_control_plane_contains_no_mutating_or_network_client_calls(self):
         source = CONTROL.read_text(encoding="utf-8").lower()
@@ -108,7 +154,7 @@ class AureonControlPlaneTests(unittest.TestCase):
         self.assertNotIn("obs-studio", containerfile.lower())
 
     def test_named_phase_commands_are_safe_wrappers_around_the_control_plane(self):
-        helpers = ("aureon-hardware", "aureon-driver", "aureon-resource", "aureon-integrity", "aureon-integrityctl")
+        helpers = ("aureon-core", "aureon-services", "aureon-hardware", "aureon-driver", "aureon-resource", "aureon-integrity", "aureon-integrityctl")
         helper_root = CONTROL.parent
         for helper in helpers:
             source = (helper_root / helper).read_text(encoding="utf-8")
