@@ -1,0 +1,166 @@
+{
+  "baseline": {
+    "build_id": "phase0-review-20260724t164040z",
+    "path": "docs/testing/phase0-review-20260724t164040z.json",
+    "readiness_after_seconds": 63.733,
+    "wall_duration_seconds": 75.488
+  },
+  "completed": 3,
+  "failed": 0,
+  "interpretation": {
+    "base_images_identical_across_runs": false,
+    "classification": "exploratory-baseline",
+    "suitable_as_final_boot_regression_baseline": false,
+    "warm_cache_or_order_effect_possible": true
+  },
+  "isolation": {
+    "base_storage_mode": "independent copy-on-write overlay per run",
+    "guest_network": "none",
+    "host_directories_mounted_in_guest": false,
+    "physical_block_devices_accessed": false,
+    "windows_install_or_boot_changes": false
+  },
+  "passed": 3,
+  "requested": 3,
+  "run_id": "phase1-baseline-20260724",
+  "runs": [
+    {
+      "acceleration": "kvm",
+      "artifacts": {
+        "base_qcow2": {
+          "path": "images/phase1-baseline-20260724-r01/aureon-base.qcow2",
+          "sha256": "67893f7e963f8b1fcced71e86ea80d15cad95415d17295ddfc6422154c7113c6",
+          "size_bytes": 1307836416
+        },
+        "overlay": {
+          "path": "work/qemu/phase1-baseline-20260724-r01/smoke-overlay.qcow2",
+          "sha256": "a8bd730d20100df162d1512ac052168dc03853987c8c0abe899f8f0cce90a876",
+          "size_bytes": 24444928
+        },
+        "qemu_log": {
+          "path": "work/qemu/phase1-baseline-20260724-r01/qemu.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0
+        },
+        "serial_log": {
+          "path": "work/qemu/phase1-baseline-20260724-r01/serial.log",
+          "sha256": "682e13b79b5da6099a99e898451126aed8252b18468c61d0fb5c8a19e4133874",
+          "size_bytes": 115517
+        }
+      },
+      "base_sha256_before_and_after": "67893f7e963f8b1fcced71e86ea80d15cad95415d17295ddfc6422154c7113c6",
+      "build_id": "phase1-baseline-20260724-r01",
+      "memory_mib": 4096,
+      "overlay_integrity": "passed",
+      "qemu_exit_code": 0,
+      "readiness_after_seconds": 72.025,
+      "source_path": "work/measurements/phase1-baseline-20260724/runs/r01.json",
+      "status": "passed",
+      "timeout_reached": false,
+      "vcpus": 2,
+      "wall_duration_seconds": 88.284
+    },
+    {
+      "acceleration": "kvm",
+      "artifacts": {
+        "base_qcow2": {
+          "path": "images/phase1-baseline-20260724-r02/aureon-base.qcow2",
+          "sha256": "910f921c0ec5fea2393fab88d77e67cd1223f2fe80e79d498522d95ed451eb07",
+          "size_bytes": 1309016064
+        },
+        "overlay": {
+          "path": "work/qemu/phase1-baseline-20260724-r02/smoke-overlay.qcow2",
+          "sha256": "b4964464d929c0d2f05824d71d91926904605960809a4c0f3b00ecace2ac4477",
+          "size_bytes": 24510464
+        },
+        "qemu_log": {
+          "path": "work/qemu/phase1-baseline-20260724-r02/qemu.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0
+        },
+        "serial_log": {
+          "path": "work/qemu/phase1-baseline-20260724-r02/serial.log",
+          "sha256": "d9317380aa965764f746bf9e1f562b06ec660bc5367f4a12d369b52a9a65302e",
+          "size_bytes": 113367
+        }
+      },
+      "base_sha256_before_and_after": "910f921c0ec5fea2393fab88d77e67cd1223f2fe80e79d498522d95ed451eb07",
+      "build_id": "phase1-baseline-20260724-r02",
+      "memory_mib": 4096,
+      "overlay_integrity": "passed",
+      "qemu_exit_code": 0,
+      "readiness_after_seconds": 71.865,
+      "source_path": "work/measurements/phase1-baseline-20260724/runs/r02.json",
+      "status": "passed",
+      "timeout_reached": false,
+      "vcpus": 2,
+      "wall_duration_seconds": 84.872
+    },
+    {
+      "acceleration": "kvm",
+      "artifacts": {
+        "base_qcow2": {
+          "path": "images/phase1-baseline-20260724-r03/aureon-base.qcow2",
+          "sha256": "9bd7daf7da33f78326aad83334d04686a82ce37411e051c67f9fab246338a6f4",
+          "size_bytes": 1308491776
+        },
+        "overlay": {
+          "path": "work/qemu/phase1-baseline-20260724-r03/smoke-overlay.qcow2",
+          "sha256": "5a03230a610b27db8a93e45b74f076454eb815fe5d181bb3b31304cdd465383c",
+          "size_bytes": 24313856
+        },
+        "qemu_log": {
+          "path": "work/qemu/phase1-baseline-20260724-r03/qemu.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0
+        },
+        "serial_log": {
+          "path": "work/qemu/phase1-baseline-20260724-r03/serial.log",
+          "sha256": "55927e88832bb937f1634660ce21f86b64022f5d7b0488a1fa5d35f32537f2fd",
+          "size_bytes": 113437
+        }
+      },
+      "base_sha256_before_and_after": "9bd7daf7da33f78326aad83334d04686a82ce37411e051c67f9fab246338a6f4",
+      "build_id": "phase1-baseline-20260724-r03",
+      "memory_mib": 4096,
+      "overlay_integrity": "passed",
+      "qemu_exit_code": 0,
+      "readiness_after_seconds": 68.873,
+      "source_path": "work/measurements/phase1-baseline-20260724/runs/r03.json",
+      "status": "passed",
+      "timeout_reached": false,
+      "vcpus": 2,
+      "wall_duration_seconds": 81.88
+    }
+  ],
+  "schema_version": 1,
+  "source_evidence": {
+    "measurement_json": "work/measurements/phase1-baseline-20260724/measurement.json",
+    "measurement_markdown": "work/measurements/phase1-baseline-20260724/measurement.md"
+  },
+  "statistics": {
+    "duration_seconds": {
+      "maximum": 88.284,
+      "mean": 85.012,
+      "median": 84.872,
+      "minimum": 81.88
+    },
+    "overlay_size_bytes": {
+      "maximum": 24510464.0,
+      "mean": 24423082.666666668,
+      "median": 24444928.0,
+      "minimum": 24313856.0
+    },
+    "readiness_seconds": {
+      "maximum": 72.025,
+      "mean": 70.921,
+      "median": 71.865,
+      "minimum": 68.873
+    },
+    "variation_percent_from_phase0": {
+      "readiness_mean": 11.278301664757677,
+      "wall_duration_mean": 12.616574819838917
+    }
+  },
+  "status": "passed"
+}
