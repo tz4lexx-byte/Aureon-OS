@@ -6,10 +6,12 @@ Wants=greetd.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/echo AUREON_DESKTOP_READY
+User=aureon
+Group=aureon
+ExecStart=/usr/libexec/aureon/aureon-wait-desktop-ready
+TimeoutStartSec=300
 StandardOutput=journal+console
 StandardError=journal+console
-DynamicUser=yes
 NoNewPrivileges=yes
 PrivateDevices=yes
 PrivateNetwork=yes

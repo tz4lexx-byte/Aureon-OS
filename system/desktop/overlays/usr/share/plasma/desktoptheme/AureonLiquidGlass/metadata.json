@@ -1,0 +1,16 @@
+{
+  "KPlugin": {
+    "Authors": [
+      {
+        "Name": "Aureon OS Project"
+      }
+    ],
+    "Description": "Translucent blue-violet surfaces for the Aureon Liquid Glass profile",
+    "EnabledByDefault": true,
+    "Id": "AureonLiquidGlass",
+    "License": "GPL-3.0-or-later",
+    "Name": "Aureon Liquid Glass",
+    "Version": "0.2.0"
+  },
+  "X-Plasma-API": "5.0"
+}

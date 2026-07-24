@@ -1,0 +1,26 @@
+{
+  "schema": "aureon.display-profile",
+  "version": 1,
+  "preview_request": {
+    "width": 1920,
+    "height": 1080,
+    "refresh_hz": 60,
+    "scale": 1.0,
+    "connector": "auto-primary-virtual-output"
+  },
+  "qemu": {
+    "default_adapter": "virtio",
+    "default_device": "virtio-vga,edid=on,xres=1920,yres=1080,max_outputs=1",
+    "compatibility_device": "VGA,vgamem_mb=64",
+    "display_backend": "gtk,gl=off,zoom-to-fit=off,show-tabs=off",
+    "local_qmp_framebuffer_capture": true
+  },
+  "policy": {
+    "applies_only_to_disposable_preview": true,
+    "physical_displays_are_never_reconfigured_by_this_profile": true,
+    "user_can_change_guest_resolution_after_login": true,
+    "runtime_observation_required_before_claiming_full_hd": true,
+    "kernel_mode_forcing_disabled_after_virtio_rejection": true,
+    "non_uniform_1920x1080_framebuffer_required_before_claiming_usable": true
+  }
+}

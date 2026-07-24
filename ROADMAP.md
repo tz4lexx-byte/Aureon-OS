@@ -1,35 +1,53 @@
 # Roadmap
 
-## Fase 0 — Investigación y cimientos
+## Plan maestro 0–32
 
-- [x] Crear repositorio local aislado.
-- [x] Registrar la decisión de base del sistema y sus alternativas.
-- [x] Documentar modelo inicial de amenazas y presupuesto de rendimiento.
-- [x] Implementar `aureon-dev doctor` de solo lectura, con pruebas unitarias.
-- [x] Configurar `Ubuntu-24.04` en WSL2 y verificar Podman, QEMU, `qemu-img` y OVMF dentro del guest.
-- [x] Implementar `aureon-dev build` e `image` como planes deterministas de *dry-run*, con rechazo de rutas externas, discos físicos y modos de ejecución no verificados.
-- [x] Completar la revisión por digest de la base Fedora bootc y del CLI unificado `image-builder` antes de activar el experimento de receta.
-- [ ] Ejecutar y aprobar el runner reproducible de una imagen bootc mínima. El runner `test-smoke --execute` y sus pruebas unitarias ya existen; falta su primera ejecución real con un build ID nuevo.
-- [x] Convertir la imagen derivada a `qcow2` dentro de una ruta virtual permitida (`phase0-f44-20260718`).
-- [x] Arrancar esa imagen con QEMU y OVMF, capturar consola serial y apagar limpiamente con KVM (`phase0-f44-20260718`).
-- [ ] Ejecutar `aureon-dev test-smoke --execute` y guardar la primera evidencia verificable. El modo *dry-run*, las validaciones de seguridad y el runner ya están implementados.
-- [x] Revisar las unidades systemd creadas por los paquetes de Podman/QEMU dentro de WSL antes del primer build real.
+El estado completo vive en
+[`packaging/aureon-control-plane.json`](packaging/aureon-control-plane.json) y
+se consulta sin escribir con:
 
-### Criterio de salida
+```bash
+python3 tools/aureonctl status
+python3 tools/aureonctl validate
+```
 
-Desde un checkout limpio, un comando implementado y revisado construye una imagen mínima a partir de referencias fijadas, usa solo almacenamiento virtual permitido, la arranca en QEMU, confirma el target de systemd definido, ejecuta un smoke test, guarda logs y apaga la VM. La evidencia debe registrar ID de build, hashes, acelerador, duración, rutas de imagen y logs. Un resultado con TCG es funcional, no un benchmark.
+Los estados `implemented-awaiting-runtime-validation` significan que el código
+y sus pruebas están preparados, pero la prueba de salida todavía necesita una
+imagen nueva. Las fases que requieren hardware, firmware, discos físicos o
+consentimiento permanecen explícitamente bloqueadas.
 
-## Fase 1 — Escritorio funcional
+## Bloque I — Fundamentos
 
-Wayland, login, sesión, panel, lanzador, notificaciones, controles básicos, terminal y explorador de archivos. No comienza hasta que Fase 0 sea reproducible.
+- [x] Fase 0: contrato de autoridad A–D, privacidad, datos, actualizaciones,
+  controladores y modos.
+- [x] Fase 1: tags recuperables, artefactos separados y recuperación sin
+  sobrescritura.
+- [x] Fase 2 (fuente): base fijada por digest, cachés locales fuera del
+  contexto, manifiesto fuente e inventario RPM por build.
+- [x] Fase 3 (fuente): baseline local ampliado y transporte de evidencia por
+  consola serial.
+- [ ] Fases 2–3 (runtime): construir dos veces desde estados limpios y comparar
+  inventarios, manifiestos y métricas.
 
-## Fases posteriores
+## Bloque II — Sistema base ligero
 
-2. Identidad visual y accesibilidad.
-3. Aureon Insight y `aureond`.
-4. Actualizaciones atómicas, rollback y recovery.
-5. Gaming.
-6. Instalador y pruebas de hardware real dedicado.
-7. Beta, localización y auditoría.
+- [x] Fase 4 (fuente): Core KDE/Wayland mínimo y `aureonctl core doctor`.
+- [x] Fase 5 (fuente): Liquid Glass, solicitud 1920×1080, observación KScreen,
+  GTK/X11 para WSLg y readiness real de KWin/Plasma.
+- [x] Fase 6 (fuente): clasificación y auditoría de servicios bajo demanda.
+- [ ] Fases 4–6 (runtime): validar una preview nueva y usable con los informes
+  automáticos `core`, `baseline` y `services`.
 
-Los criterios detallados de cada fase se añaden antes de comenzar su implementación.
+## Bloques posteriores
+
+- 7–10: recursos, memoria, CPU/I/O y arquitectura de datos.
+- 11–14: hardware, Driver Fabric, gráficos, audio e input.
+- 15–16: kernel y compatibilidad Windows.
+- 17–20: gaming y streaming.
+- 21–24: seguridad e Integrity.
+- 25–28: actualizaciones, firmware e instalador.
+- 29–32: laboratorio, comparación, UX y release.
+
+Los fundamentos declarativos de estos bloques existen, pero no equivalen a sus
+pruebas de salida. Consulta [el mapa de fases](docs/aureon-phase-map.md) y
+[la validación conjunta 2–6](docs/testing/phase-2-6-validation.md).

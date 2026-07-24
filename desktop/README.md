@@ -1,16 +1,19 @@
 # Aureon Desktop Preview
 
-Este directorio documenta la capa de escritorio que se ejecuta únicamente
-dentro de una imagen `qcow2` de prueba. Su definición reproducible está en
-`system/desktop/`. No instala ni configura Windows, el firmware del equipo,
-discos físicos ni el cargador de arranque del host.
+La capa de escritorio vive en `system/desktop/` y se ejecuta únicamente dentro
+de un `qcow2` desechable. No instala ni configura Windows, firmware, discos
+físicos ni el cargador de arranque del host.
 
-La primera variante gráfica usa KDE Plasma en una VM aislada, con red del
-guest deshabilitada y sin carpetas compartidas con el host. El usuario
-temporal `aureon` existe solo dentro de esa VM, no tiene contraseña utilizable
-ni permisos de `sudo`, y entra automáticamente para que puedas ver el
-escritorio sin configurar nada en tu PC.
+La preview usa KDE Plasma/Wayland, un usuario temporal sin contraseña ni sudo,
+guest sin red y overlays QEMU separados. El próximo build incorpora:
 
-Usa `tools/aureon-desktop-preview --dry-run` para inspeccionar el plan o
-consulta [la guía de uso](../docs/testing/desktop-preview.md) para la orden de
-PowerShell que abre la ventana de QEMU mediante WSLg.
+- Aureon Liquid Glass con assets SVG locales;
+- modo solicitado y observado de 1920×1080 a escala 1;
+- marcador de sesión solo después de KWin/Plasma responsivos;
+- inventario de paquetes y baseline local;
+- diagnósticos `aureon-core`, `aureon-services`, `aureon-hardware`,
+  `aureon-driver`, `aureon-resource` y `aureon-integrity`.
+
+Todos estos comandos inspeccionan o crean planes: no instalan controladores, no
+transmiten datos, no aplican límites y no realizan cambios de disco. Consulta
+[la guía de preview](../docs/testing/desktop-preview.md).

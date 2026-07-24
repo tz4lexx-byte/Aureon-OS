@@ -1,0 +1,3 @@
+#!/bin/sh
+# Local inspection only; see aureonctl hardware doctor.
+exec /usr/bin/aureonctl hardware "$@"

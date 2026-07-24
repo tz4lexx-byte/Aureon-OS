@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Aureon signed game compatibility profile",
+  "type": "object",
+  "required": ["game", "profile_version", "proton", "renderer", "known_issues", "tested_at"],
+  "properties": {
+    "game": {"type": "string", "minLength": 1},
+    "profile_version": {"type": "string", "minLength": 1},
+    "proton": {"type": "string", "minLength": 1},
+    "renderer": {"enum": ["vulkan", "opengl", "native"]},
+    "environment": {"type": "object", "additionalProperties": {"type": "string"}},
+    "known_issues": {"type": "array", "items": {"type": "string"}},
+    "tested_at": {"type": "string", "format": "date-time"},
+    "signature": {"type": "string"}
+  },
+  "additionalProperties": false
+}

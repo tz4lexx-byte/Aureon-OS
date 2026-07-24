@@ -1,0 +1,7 @@
+#!/bin/sh
+# The first implementation renders policy only; no cgroup is changed.
+if [ "${1:-}" = "doctor" ]; then
+    shift
+    exec /usr/bin/aureonctl resource plan --mode stable "$@"
+fi
+exec /usr/bin/aureonctl resource "$@"

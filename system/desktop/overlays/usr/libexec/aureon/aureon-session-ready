@@ -1,0 +1,150 @@
+#!/bin/sh
+# Session-local readiness probe for the disposable Aureon desktop preview.
+set -u
+
+if [ "$(id -un)" != "aureon" ]; then
+    exit 1
+fi
+
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+state_dir="${runtime_dir}/aureon"
+state_file="${state_dir}/session-state"
+ready_file="${state_dir}/session-ready"
+temporary_file="${state_dir}/session-state.$$"
+kscreen_before="${state_dir}/kscreen-before.json"
+kscreen_after="${state_dir}/kscreen-after.json"
+kscreen_error="${state_dir}/kscreen-error.txt"
+display_observation="${state_dir}/display-observation.json"
+probe_state="running"
+session_state="waiting-for-plasma"
+kwin_state="not-observed"
+plasma_state="not-observed"
+display_state="not-observed"
+appearance_state="not-applied"
+failure_reason="none"
+umask 077
+install -d -m 0700 "$state_dir"
+rm -f "$ready_file" "$state_file" "$kscreen_before" "$kscreen_after" \
+    "$kscreen_error" "$display_observation" \
+    "${state_dir}/baseline.json" "${state_dir}/core.json" "${state_dir}/services.json"
+
+write_state() {
+    {
+        printf 'probe_state=%s\n' "$probe_state"
+        printf 'session=%s\n' "$session_state"
+        printf 'kwin_wayland=%s\n' "$kwin_state"
+        printf 'plasmashell=%s\n' "$plasma_state"
+        printf 'appearance_state=%s\n' "$appearance_state"
+        printf 'display_requested=1920x1080@60\n'
+        printf 'display_state=%s\n' "$display_state"
+        printf 'failure_reason=%s\n' "$failure_reason"
+        if [ -r "$display_observation" ]; then
+            sed 's/^/display_observation=/' "$display_observation"
+        fi
+        if [ -s "$kscreen_error" ]; then
+            sed 's/^/kscreen_error=/' "$kscreen_error" | head -n 20
+        fi
+    } > "$temporary_file"
+    chmod 0600 "$temporary_file"
+    mv -f "$temporary_file" "$state_file"
+}
+
+fail_probe() {
+    probe_state="failed"
+    failure_reason="$1"
+    write_state
+    exit 1
+}
+
+write_state
+
+dbus_tool=""
+if command -v busctl >/dev/null 2>&1; then
+    dbus_tool="busctl"
+elif command -v qdbus6 >/dev/null 2>&1; then
+    dbus_tool="qdbus6"
+elif command -v qdbus-qt6 >/dev/null 2>&1; then
+    dbus_tool="qdbus-qt6"
+elif command -v qdbus >/dev/null 2>&1; then
+    dbus_tool="qdbus"
+fi
+
+responsive=false
+attempt=0
+while [ "$attempt" -lt 120 ]; do
+    if pgrep -u "$(id -u)" -x kwin_wayland >/dev/null 2>&1 &&
+        pgrep -u "$(id -u)" -x plasmashell >/dev/null 2>&1; then
+        if [ "$dbus_tool" = "busctl" ]; then
+            if busctl --user call org.kde.KWin /KWin org.freedesktop.DBus.Peer Ping >/dev/null 2>&1 &&
+                busctl --user call org.kde.plasmashell /PlasmaShell org.freedesktop.DBus.Peer Ping >/dev/null 2>&1; then
+                responsive=true
+                break
+            fi
+        elif [ -n "$dbus_tool" ] &&
+            "$dbus_tool" org.kde.KWin /KWin org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1 &&
+            "$dbus_tool" org.kde.plasmashell /PlasmaShell org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then
+            responsive=true
+            break
+        fi
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+
+if [ "$responsive" != true ]; then
+    fail_probe "plasma-dbus-timeout"
+fi
+session_state="responsive"
+kwin_state="responsive"
+plasma_state="responsive"
+write_state
+
+if /usr/libexec/aureon/aureon-apply-appearance &&
+    [ -e "${XDG_CONFIG_HOME:-$HOME/.config}/aureon/liquid-glass-v1-applied" ]; then
+    appearance_state="applied"
+else
+    fail_probe "appearance-application-failed"
+fi
+write_state
+
+if ! command -v kscreen-doctor >/dev/null 2>&1; then
+    fail_probe "kscreen-doctor-missing"
+fi
+if ! kscreen-doctor -j > "$kscreen_before" 2> "$kscreen_error"; then
+    fail_probe "kscreen-query-failed"
+fi
+selection="$(/usr/libexec/aureon/aureon-display select < "$kscreen_before" 2>> "$kscreen_error")" ||
+    fail_probe "full-hd-mode-unavailable"
+set -- $selection
+if [ "$#" -ne 2 ]; then
+    fail_probe "invalid-display-selection"
+fi
+if ! kscreen-doctor "output.$1.mode.$2" "output.$1.scale.1" >/dev/null 2>> "$kscreen_error"; then
+    fail_probe "full-hd-mode-apply-failed"
+fi
+sleep 2
+if ! kscreen-doctor -j > "$kscreen_after" 2>> "$kscreen_error"; then
+    fail_probe "kscreen-requery-failed"
+fi
+if /usr/libexec/aureon/aureon-display observe < "$kscreen_after" > "$display_observation" 2>> "$kscreen_error"; then
+    display_state="observed-1920x1080@60"
+else
+    display_state="requested-not-observed"
+    fail_probe "full-hd-observation-failed"
+fi
+write_state
+
+if ! /usr/bin/aureonctl baseline > "${state_dir}/baseline.json"; then
+    fail_probe "baseline-diagnostic-failed"
+fi
+if ! /usr/bin/aureonctl core doctor > "${state_dir}/core.json"; then
+    fail_probe "core-diagnostic-failed"
+fi
+if ! /usr/bin/aureonctl services doctor > "${state_dir}/services.json"; then
+    fail_probe "services-diagnostic-failed"
+fi
+chmod 0600 "${state_dir}/baseline.json" "${state_dir}/core.json" "${state_dir}/services.json"
+probe_state="passed"
+failure_reason="none"
+write_state
+: > "$ready_file"

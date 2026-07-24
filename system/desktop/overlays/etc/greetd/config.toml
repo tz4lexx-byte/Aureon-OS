@@ -5,9 +5,9 @@
 vt = 1
 
 [default_session]
-command = "agreety --cmd 'dbus-run-session -- startplasma-wayland'"
+command = "agreety --cmd '/usr/libexec/aureon/aureon-plasma-session'"
 user = "greetd"
 
 [initial_session]
-command = "dbus-run-session -- startplasma-wayland"
+command = "/usr/libexec/aureon/aureon-plasma-session"
 user = "aureon"

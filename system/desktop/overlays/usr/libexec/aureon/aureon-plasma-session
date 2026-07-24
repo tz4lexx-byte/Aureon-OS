@@ -1,0 +1,35 @@
+#!/bin/sh
+# Start Plasma through Fedora's session-aware D-Bus wrapper.  The second pass
+# runs inside that selected bus and starts the bounded readiness probe before
+# Plasma so diagnostics do not depend on XDG autostart discovery.
+set -eu
+
+if [ "$(id -un)" != "aureon" ]; then
+    exit 1
+fi
+
+export XDG_SESSION_TYPE=wayland
+export XDG_SESSION_DESKTOP=KDE
+export XDG_CURRENT_DESKTOP=KDE
+export XDG_SESSION_CLASS=user
+export KWIN_COMPOSE=Q
+export QT_QUICK_BACKEND=software
+export QSG_RENDER_LOOP=basic
+
+if [ "${AUREON_PLASMA_INNER:-0}" != "1" ]; then
+    export AUREON_PLASMA_INNER=1
+    exec /usr/libexec/plasma-dbus-run-session-if-needed "$0"
+fi
+
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+state_dir="${runtime_dir}/aureon"
+umask 077
+install -d -m 0700 "$state_dir"
+printf 'launcher_state=starting-plasma\n' > "${state_dir}/launcher-state"
+
+set +e
+/usr/bin/startplasma-wayland
+status=$?
+set -e
+printf 'launcher_state=plasma-exited\nexit_code=%s\n' "$status" > "${state_dir}/launcher-state"
+exit "$status"

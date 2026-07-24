@@ -3,13 +3,13 @@ widgetStyle=Breeze
 LookAndFeelPackage=org.aureon.desktop
 
 [kdeglobals][General]
-ColorScheme=BreezeDark
+ColorScheme=AureonLiquidGlass
 
 [kdeglobals][Icons]
 Theme=breeze
 
 [plasmarc][Theme]
-name=default
+name=AureonLiquidGlass
 
 [Wallpaper]
 Image=Next
@@ -24,6 +24,9 @@ theme=Breeze
 [kwinrc][Plugins]
 blurEnabled=true
 contrastEnabled=true
+
+[kwinrc][Effect-Blur]
+BlurStrength=6
 
 [ksplashrc][KSplash]
 Theme=org.kde.breeze.desktop

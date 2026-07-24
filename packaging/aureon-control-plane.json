@@ -1,0 +1,166 @@
+{
+  "schema": "aureon.control-plane",
+  "version": 1,
+  "default_mode": "stable",
+  "privacy": {
+    "network_default": "disabled",
+    "telemetry": "disabled",
+    "diagnostics": "local-only-until-the-user-exports-them",
+    "persistent_hardware_identifier": "forbidden"
+  },
+  "modes": {
+    "stable": {
+      "description": "Conservador, sin acciones de rendimiento permanentes.",
+      "automatic_actions": ["baseline.collect", "resource.defer-maintenance"]
+    },
+    "gaming": {
+      "description": "Perfil temporal para una sesión de juego autorizada.",
+      "automatic_actions": ["resource.defer-maintenance", "resource.protect-interactive"]
+    },
+    "streaming": {
+      "description": "Perfil temporal que reserva recursos; no inicia una transmisión.",
+      "automatic_actions": ["resource.defer-maintenance", "resource.protect-interactive"]
+    },
+    "competitive": {
+      "description": "Requiere activación explícita por juego y no está implementado en esta preview.",
+      "automatic_actions": []
+    },
+    "development": {
+      "description": "Permite diagnósticos adicionales locales; nunca eleva permisos automáticamente.",
+      "automatic_actions": []
+    }
+  },
+  "actions": {
+    "desktop.apply-appearance": {
+      "authority": "A",
+      "data": ["preferencia visual local", "preferencias de accesibilidad"],
+      "impact": "Cambia tema, color, transparencia o wallpaper solo en la sesión local.",
+      "reversible": true,
+      "network": false,
+      "implementation": "aureonctl appearance plan; defaults de Plasma"
+    },
+    "baseline.collect": {
+      "authority": "A",
+      "data": ["metricas locales del sistema", "estado de servicios", "presion de recursos"],
+      "impact": "Lee el sistema y escribe solamente si el usuario redirige la salida.",
+      "reversible": true,
+      "network": false,
+      "implementation": "aureonctl baseline"
+    },
+    "resource.defer-maintenance": {
+      "authority": "A",
+      "data": ["estado de sesion", "presion de CPU, memoria e I/O"],
+      "impact": "Plan temporal de posponer trabajo diferible.",
+      "reversible": true,
+      "network": false,
+      "implementation": "aureonctl resource plan"
+    },
+    "resource.protect-interactive": {
+      "authority": "A",
+      "data": ["perfil de sesion elegido"],
+      "impact": "Plan de pesos cgroup temporales; no mata procesos ni fija prioridad maxima.",
+      "reversible": true,
+      "network": false,
+      "implementation": "aureonctl resource plan"
+    },
+    "audio.restore-authorized-route": {
+      "authority": "A",
+      "data": ["preferencia de salida autorizada"],
+      "impact": "Solo restaura una ruta de audio guardada por el usuario.",
+      "reversible": true,
+      "network": false,
+      "implementation": "planned"
+    },
+    "driver.rollback-boot-failure": {
+      "authority": "B",
+      "data": ["resultado de arranque", "despliegues locales"],
+      "impact": "Selecciona el despliegue local anterior despues de un fallo de arranque demostrado.",
+      "reversible": true,
+      "network": false,
+      "implementation": "planned"
+    },
+    "update.download-idle": {
+      "authority": "B",
+      "data": ["estado de sesion", "estado de red autorizado"],
+      "impact": "Descarga un despliegue sin activarlo; no reinicia.",
+      "reversible": true,
+      "network": true,
+      "implementation": "planned"
+    },
+    "driver.install-proprietary": {
+      "authority": "C",
+      "data": ["identificadores de hardware locales", "manifiesto del controlador"],
+      "impact": "Instala software adicional y puede requerir reinicio.",
+      "reversible": true,
+      "network": true,
+      "implementation": "blocked-until-user-confirmation"
+    },
+    "integrity.enable-competitive": {
+      "authority": "C",
+      "data": ["estado de arranque", "modulos", "archivos de juego elegidos"],
+      "impact": "Activa una politica temporal asociada a un juego concreto.",
+      "reversible": true,
+      "network": "only-after-per-game-consent",
+      "implementation": "design-only"
+    },
+    "firmware.update": {
+      "authority": "C",
+      "data": ["dispositivo y version de firmware"],
+      "impact": "Puede requerir corriente, reinicio y recuperacion del fabricante.",
+      "reversible": false,
+      "network": true,
+      "implementation": "blocked-until-user-confirmation"
+    },
+    "installer.partition-or-format": {
+      "authority": "D",
+      "data": ["inventario de discos seleccionado por el usuario"],
+      "impact": "Puede destruir datos o alterar el arranque.",
+      "reversible": false,
+      "network": false,
+      "implementation": "manual-only"
+    },
+    "diagnostics.export": {
+      "authority": "D",
+      "data": ["diagnosticos que el usuario selecciona"],
+      "impact": "Comparte datos fuera del equipo.",
+      "reversible": false,
+      "network": true,
+      "implementation": "manual-only"
+    }
+  },
+  "phases": [
+    {"id": 0, "name": "Constitucion tecnica", "state": "implemented-foundation", "evidence": ["docs/aureon-user-authority.md", "packaging/aureon-control-plane.json"]},
+    {"id": 1, "name": "Proteger el trabajo actual", "state": "implemented-foundation", "evidence": ["docs/recovery/preview-recovery.md", "tag:aureon-liquid-glass-v0.2.0"]},
+    {"id": 2, "name": "Construccion reproducible", "state": "implemented-awaiting-runtime-validation", "evidence": ["system/desktop/.containerignore", "aureonctl reproducibility", "build/desktop-<id>/desktop-packages.lock.json"]},
+    {"id": 3, "name": "Medicion inicial", "state": "implemented-awaiting-runtime-validation", "evidence": ["system/desktop/overlays/usr/libexec/aureon/aureon-baseline", "aureonctl baseline", "preview guest_evidence.baseline"]},
+    {"id": 4, "name": "Aureon Core minimo", "state": "implemented-awaiting-runtime-validation", "evidence": ["system/desktop/Containerfile", "aureonctl core doctor", "preview guest_evidence.core"]},
+    {"id": 5, "name": "Escritorio silencioso", "state": "implemented-awaiting-runtime-validation", "evidence": ["packaging/display-profile.json", "aureon-session-ready", "AureonLiquidGlass"]},
+    {"id": 6, "name": "Servicios bajo demanda", "state": "implemented-awaiting-runtime-validation", "evidence": ["packaging/service-classes.json", "aureonctl services doctor", "preview guest_evidence.services"]},
+    {"id": 7, "name": "Resource Manager", "state": "implemented-foundation", "evidence": ["aureonctl resource plan", "docs/architecture/aureon-resource-manager.md"]},
+    {"id": 8, "name": "Memoria inteligente", "state": "implemented-foundation", "evidence": ["docs/architecture/aureon-resource-manager.md"]},
+    {"id": 9, "name": "CPU, latencia e I/O", "state": "implemented-foundation", "evidence": ["aureonctl resource plan"]},
+    {"id": 10, "name": "Arquitectura de datos", "state": "implemented-foundation", "evidence": ["packaging/data-classes.json"]},
+    {"id": 11, "name": "Inventario de hardware", "state": "implemented-foundation", "evidence": ["aureonctl hardware doctor"]},
+    {"id": 12, "name": "Driver Fabric", "state": "implemented-foundation", "evidence": ["packaging/driver-policy.json", "aureonctl driver doctor"]},
+    {"id": 13, "name": "Graficos, video y pantallas", "state": "hardware-validation-required", "evidence": ["aureonctl driver doctor"]},
+    {"id": 14, "name": "Audio, captura e input", "state": "hardware-validation-required", "evidence": ["aureonctl hardware doctor"]},
+    {"id": 15, "name": "Kernel base estable", "state": "hardware-validation-required", "evidence": ["kernel-config/README.md"]},
+    {"id": 16, "name": "Compatibilidad Windows", "state": "implemented-foundation", "evidence": ["aureonctl driver doctor", "docs/architecture/windows-compatibility.md"]},
+    {"id": 17, "name": "Game Runtime", "state": "implemented-foundation", "evidence": ["aureonctl gaming plan"]},
+    {"id": 18, "name": "Compatibilidad por juego", "state": "implemented-foundation", "evidence": ["packaging/game-profile.schema.json"]},
+    {"id": 19, "name": "Gaming Mode", "state": "implemented-foundation", "evidence": ["aureonctl gaming plan"]},
+    {"id": 20, "name": "Streaming Mode", "state": "implemented-foundation", "evidence": ["aureonctl streaming plan"]},
+    {"id": 21, "name": "Base de seguridad", "state": "implemented-foundation", "evidence": ["aureonctl integrity doctor", "docs/security/aureon-security-baseline.md"]},
+    {"id": 22, "name": "Integrity Basic", "state": "implemented-foundation", "evidence": ["aureonctl integrity doctor"]},
+    {"id": 23, "name": "Integrity Competitive", "state": "design-only", "evidence": ["docs/security/aureon-integrity.md"]},
+    {"id": 24, "name": "Modulo minimo de Integrity", "state": "blocked-by-necessity-review", "evidence": ["docs/security/aureon-integrity.md"]},
+    {"id": 25, "name": "Actualizaciones atomicas", "state": "implemented-foundation", "evidence": ["aureonctl update plan", "docs/recovery/atomic-updates.md"]},
+    {"id": 26, "name": "Actualizaciones de controladores", "state": "implemented-foundation", "evidence": ["aureonctl update plan", "packaging/driver-policy.json"]},
+    {"id": 27, "name": "Firmware", "state": "manual-confirmation-required", "evidence": ["aureonctl update plan"]},
+    {"id": 28, "name": "Instalador y arranque dual", "state": "manual-confirmation-required", "evidence": ["aureonctl installer plan", "docs/installer/safety-contract.md"]},
+    {"id": 29, "name": "Laboratorio de compatibilidad", "state": "implemented-foundation", "evidence": ["docs/testing/compatibility-lab.md"]},
+    {"id": 30, "name": "Comparacion contra Windows", "state": "hardware-validation-required", "evidence": ["docs/testing/benchmark-protocol.md"]},
+    {"id": 31, "name": "Pruebas de molestias", "state": "implemented-foundation", "evidence": ["docs/testing/interaction-contract.md"]},
+    {"id": 32, "name": "Canales y Aureon 1.0", "state": "release-gated", "evidence": ["docs/release/channels-and-gates.md"]}
+  ]
+}

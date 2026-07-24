@@ -11,6 +11,28 @@ count_nonempty()
     awk 'NF { count++ } END { print count + 0 }'
 }
 
+cpu_counters()
+{
+    awk '/^cpu / { total = 0; for (field = 2; field <= NF; field++) total += $field; print total, $5 + $6; exit }' /proc/stat
+}
+
+network_counters()
+{
+    awk -F '[: ]+' '$2 != "lo" && NF >= 18 { received += $3; transmitted += $11 } END { print received + 0, transmitted + 0 }' /proc/net/dev
+}
+
+disk_counters()
+{
+    for block_path in /sys/block/*; do
+        [ -e "$block_path" ] || continue
+        block_name="${block_path##*/}"
+        case "$block_name" in
+            loop*|ram*|zram*) continue ;;
+        esac
+        awk -v device="$block_name" '$3 == device { print $6, $10; exit }' /proc/diskstats
+    done | awk '{ read_sectors += $1; written_sectors += $2 } END { print read_sectors + 0, written_sectors + 0 }'
+}
+
 value report_format "aureon-baseline-v1"
 value timestamp_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -21,6 +43,36 @@ fi
 value os_pretty_name "${PRETTY_NAME:-unknown}"
 value kernel "$(uname -r)"
 value architecture "$(uname -m)"
+
+virtualization_kind="none"
+
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+    detected_virtualization="$(
+        systemd-detect-virt 2>/dev/null || true
+    )"
+
+    if [ -n "$detected_virtualization" ]; then
+        virtualization_kind="$detected_virtualization"
+    fi
+elif grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+    virtualization_kind="wsl"
+fi
+
+if [ "$virtualization_kind" = "wsl" ] ||
+    grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+    environment_kind="wsl-development"
+elif [ -n "${AUREON_VERSION:-}" ]; then
+    if [ "$virtualization_kind" = "none" ]; then
+        environment_kind="aureon-physical"
+    else
+        environment_kind="aureon-virtual"
+    fi
+else
+    environment_kind="linux-other"
+fi
+
+value virtualization_kind "$virtualization_kind"
+value environment_kind "$environment_kind"
 
 uptime_seconds="$(awk '{ printf "%.0f", $1 }' /proc/uptime 2>/dev/null || printf 0)"
 value uptime_seconds "$uptime_seconds"
@@ -33,6 +85,47 @@ value memory_available_mib "$(( ${mem_available_kib:-0} / 1024 ))"
 value memory_used_estimated_mib "$(( (${mem_total_kib:-0} - ${mem_available_kib:-0}) / 1024 ))"
 
 value process_count "$(ps -e --no-headers 2>/dev/null | count_nonempty)"
+value cpu_logical "$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf 0)"
+
+if read -r load_1m load_5m load_15m _ < /proc/loadavg; then
+    value load_average_1m "$load_1m"
+    value load_average_5m "$load_5m"
+    value load_average_15m "$load_15m"
+fi
+
+read -r cpu_total_before cpu_idle_before <<EOF
+$(cpu_counters)
+EOF
+read -r network_rx_before network_tx_before <<EOF
+$(network_counters)
+EOF
+read -r disk_read_before disk_write_before <<EOF
+$(disk_counters)
+EOF
+
+sleep 1
+
+read -r cpu_total_after cpu_idle_after <<EOF
+$(cpu_counters)
+EOF
+read -r network_rx_after network_tx_after <<EOF
+$(network_counters)
+EOF
+read -r disk_read_after disk_write_after <<EOF
+$(disk_counters)
+EOF
+
+cpu_total_delta=$((cpu_total_after - cpu_total_before))
+cpu_idle_delta=$((cpu_idle_after - cpu_idle_before))
+if [ "$cpu_total_delta" -gt 0 ]; then
+    value cpu_busy_percent_1s "$(awk -v total="$cpu_total_delta" -v idle="$cpu_idle_delta" 'BEGIN { printf "%.2f", 100 * (total - idle) / total }')"
+else
+    value cpu_busy_percent_1s "unavailable"
+fi
+value network_rx_bytes_1s "$((network_rx_after - network_rx_before))"
+value network_tx_bytes_1s "$((network_tx_after - network_tx_before))"
+value disk_read_bytes_1s "$(((disk_read_after - disk_read_before) * 512))"
+value disk_write_bytes_1s "$(((disk_write_after - disk_write_before) * 512))"
 
 if command -v systemctl >/dev/null 2>&1; then
     value running_services "$(
@@ -60,6 +153,14 @@ root_available_bytes="$(df -B1 / 2>/dev/null | awk 'NR == 2 { print $4 }')"
 
 value root_used_mib "$(( ${root_used_bytes:-0} / 1024 / 1024 ))"
 value root_available_mib "$(( ${root_available_bytes:-0} / 1024 / 1024 ))"
+
+root_filesystem="$(
+    findmnt -n -o FSTYPE / 2>/dev/null ||
+    stat -fc %T / 2>/dev/null ||
+    printf unknown
+)"
+
+value root_filesystem "$root_filesystem"
 
 if [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ]; then
     value cgroup_mode "v2"
@@ -94,6 +195,23 @@ fi
 if command -v systemd-analyze >/dev/null 2>&1; then
     systemd-analyze time 2>/dev/null |
         sed 's/^/boot_time=/'
+fi
+
+if command -v journalctl >/dev/null 2>&1; then
+    value boot_error_entries "$({ journalctl -b -p 0..3 --no-pager --output=short-monotonic 2>/dev/null || true; } | count_nonempty)"
+else
+    value boot_error_entries "unavailable"
+fi
+
+maximum_temperature_millicelsius="$(
+    for thermal_file in /sys/class/thermal/thermal_zone*/temp; do
+        [ -r "$thermal_file" ] && cat "$thermal_file"
+    done 2>/dev/null | awk 'BEGIN { maximum = 0 } $1 > maximum { maximum = $1 } END { print maximum + 0 }'
+)"
+if [ "${maximum_temperature_millicelsius:-0}" -gt 0 ]; then
+    value maximum_temperature_millicelsius "$maximum_temperature_millicelsius"
+else
+    value maximum_temperature_millicelsius "unavailable"
 fi
 
 for pressure_type in cpu memory io; do

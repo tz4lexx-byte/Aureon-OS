@@ -1,0 +1,6 @@
+#!/bin/sh
+# Read-only verification of the minimal desktop package surface.
+if [ "$#" -eq 0 ]; then
+    set -- doctor
+fi
+exec /usr/bin/aureonctl core "$@"

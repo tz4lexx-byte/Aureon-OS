@@ -30,6 +30,32 @@ mínima de Fase 0 no cambia ni se instala en Windows. La primera creación de la
 preview descarga los paquetes Fedora explícitamente listados dentro de Ubuntu
 WSL; su VM no tiene red, carpetas compartidas ni discos físicos.
 
+## Fundamentos de las fases maestras
+
+El control local `aureonctl` materializa los contratos de las fases 0–32 sin
+convertirse en un instalador oculto. Sus comandos son solo de diagnóstico o de
+plan: no instalan paquetes, no cambian cgroups, no inician streaming, no
+exportan datos ni aceptan discos como entrada.
+
+```bash
+python3 tools/aureonctl validate
+python3 tools/aureonctl reproducibility
+python3 tools/aureonctl status
+python3 tools/aureonctl baseline
+python3 tools/aureonctl core doctor
+python3 tools/aureonctl services doctor
+python3 tools/aureonctl resource plan --mode gaming
+python3 tools/aureonctl hardware doctor
+python3 tools/aureonctl integrity doctor
+```
+
+Consulta el [mapa de fases](docs/aureon-phase-map.md) y el
+[contrato de autoridad](docs/aureon-user-authority.md). Las fases que requieren
+hardware, firmware, particiones o consentimiento por juego permanecen
+explícitamente bloqueadas hasta tener evidencia y aprobación del usuario.
+
+La próxima preview incorpora [Aureon Liquid Glass](docs/design/aureon-liquid-glass.md), solicita y verifica 1920×1080@60, y solo declara el escritorio listo cuando KWin y Plasma responden y QMP captura un framebuffer no uniforme. El lote y su evidencia están descritos en [la validación de fases 2–6](docs/testing/phase-2-6-validation.md). Las previews anteriores se conservan como diagnóstico, pero no reciben retroactivamente estos cambios.
+
 ## Primeros comandos seguros
 
 El CLI de bootstrap ya está disponible. `doctor` solo inspecciona y puede devolver un código distinto de cero cuando el entorno aún no está listo; eso es el resultado esperado antes de instalar las dependencias. Estos comandos no instalan software ni modifican discos:

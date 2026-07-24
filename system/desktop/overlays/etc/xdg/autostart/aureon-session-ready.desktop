@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Aureon desktop readiness
+Exec=/bin/sh /usr/libexec/aureon/aureon-session-ready
+OnlyShowIn=KDE;
+NoDisplay=true
+StartupNotify=false
+X-KDE-autostart-phase=2

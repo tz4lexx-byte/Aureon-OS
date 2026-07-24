@@ -2,6 +2,9 @@
 blurEnabled=true
 contrastEnabled=true
 
+[Effect-Blur]
+BlurStrength=6
+
 [org.kde.kdecoration2]
 library=org.kde.breeze
 theme=Breeze

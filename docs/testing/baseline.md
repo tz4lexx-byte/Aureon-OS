@@ -1,0 +1,19 @@
+# Medición inicial local
+
+Desde Ubuntu WSL o desde una imagen Aureon nueva, el informe se genera sin red
+y sin guardar nada por sí mismo:
+
+```bash
+python3 tools/aureonctl baseline > aureon-baseline.json
+```
+
+La redirección es intencional: el usuario decide cuándo y dónde conservar el
+archivo. El informe contiene métricas de arranque, memoria, servicios,
+filesystem, PSI, carga, CPU ocupada durante una ventana de un segundo,
+actividad local de red y disco, errores de arranque, temperatura cuando está
+disponible, SELinux, cgroup y herramientas gráficas; no se transmite. Una
+medición WSL se etiqueta como entorno de desarrollo y no sirve para afirmar
+rendimiento de hardware o GPU.
+
+En una preview nueva el mismo informe se recoge automáticamente después de que
+KWin y Plasma respondan, y se conserva dentro de la evidencia de la sesión.

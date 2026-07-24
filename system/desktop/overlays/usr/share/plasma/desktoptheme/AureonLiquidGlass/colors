@@ -1,0 +1,14 @@
+[General]
+Name=Aureon Liquid Glass
+
+[Colors:Window]
+BackgroundNormal=22,32,57
+ForegroundNormal=241,247,255
+
+[Colors:Selection]
+BackgroundNormal=81,103,223
+ForegroundNormal=255,255,255
+
+[Colors:View]
+BackgroundNormal=18,28,51
+ForegroundNormal=239,245,255
