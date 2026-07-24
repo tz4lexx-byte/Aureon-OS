@@ -121,14 +121,46 @@ APPEARANCE_PROFILES: dict[str, dict[str, str]] = {
 }
 
 
+CORE_PACKAGES = (
+    "greetd",
+    "greetd-selinux",
+    "dbus-daemon",
+    "plasma-desktop",
+    "plasma-workspace",
+    "plasma-workspace-wayland",
+    "kwin-wayland",
+    "libkscreen",
+    "xdg-desktop-portal-kde",
+    "mesa-dri-drivers",
+    "pipewire",
+    "python3",
+    "wireplumber",
+    "dolphin",
+    "konsole",
+)
+
+PROHIBITED_AUTOMATIC_PACKAGES = (
+    "steam",
+    "wine",
+    "gamescope",
+    "obs-studio",
+)
+
+SESSION_ONLY_UNITS = {
+    "gaming": ("gamemoded.service", "aureon-gaming.service", "gamescope-session.service"),
+    "streaming": ("aureon-streaming.service", "obs-studio.service"),
+    "competitive": ("aureon-integrity.service",),
+}
+
+
 PHASE_STATES = {
     0: "implemented-foundation",
     1: "implemented-foundation",
-    2: "implemented-foundation",
-    3: "implemented",
-    4: "implemented-foundation",
-    5: "implemented-foundation",
-    6: "implemented-foundation",
+    2: "implemented-awaiting-runtime-validation",
+    3: "implemented-awaiting-runtime-validation",
+    4: "implemented-awaiting-runtime-validation",
+    5: "implemented-awaiting-runtime-validation",
+    6: "implemented-awaiting-runtime-validation",
     7: "implemented-foundation",
     8: "implemented-foundation",
     9: "implemented-foundation",
@@ -309,6 +341,116 @@ def _baseline_report() -> dict[str, Any]:
     return {"state": "available", "metrics": metrics, "raw_sections_omitted": True}
 
 
+def _query_rpm_packages(names: tuple[str, ...]) -> dict[str, Any]:
+    """Query only the fixed package names supplied by an internal catalogue."""
+
+    result = _safe_command(("rpm", "-q", "--qf", "%{NAME}\n") + names, timeout=20)
+    if result["state"] == "unavailable":
+        return {"state": "unavailable", "installed": [], "missing": list(names)}
+    installed = sorted(
+        set(str(result.get("stdout", "")).splitlines()).intersection(names)
+    )
+    missing = sorted(set(names) - set(installed))
+    return {"state": "available", "installed": installed, "missing": missing}
+
+
+def _core_report() -> dict[str, Any]:
+    """Verify the minimal desktop package surface without installing anything."""
+
+    required = _query_rpm_packages(CORE_PACKAGES)
+    prohibited = _query_rpm_packages(PROHIBITED_AUTOMATIC_PACKAGES)
+    if required["state"] == "unavailable":
+        state = "unavailable"
+    elif required["missing"] or prohibited["installed"]:
+        state = "failed"
+    else:
+        state = "passed"
+    return {
+        "state": state,
+        "inspection": "rpm database only; no package operation is performed",
+        "required_packages": list(CORE_PACKAGES),
+        "required_installed": required["installed"],
+        "required_missing": required["missing"],
+        "optional_components_forbidden_from_core": list(PROHIBITED_AUTOMATIC_PACKAGES),
+        "optional_components_found_in_core": prohibited["installed"],
+        "desktop_commands": {
+            command: _tool_state(command)
+            for command in ("startplasma-wayland", "kwin_wayland", "plasmashell", "dolphin", "konsole")
+        },
+    }
+
+
+def _service_report() -> dict[str, Any]:
+    """Check only declared session-only units; never enumerate user processes."""
+
+    units = tuple(unit for group in SESSION_ONLY_UNITS.values() for unit in group)
+    active_result = _safe_command(("systemctl", "is-active") + units, timeout=15)
+    enabled_result = _safe_command(("systemctl", "is-enabled") + units, timeout=15)
+    if active_result["state"] == "unavailable":
+        return {
+            "state": "unavailable",
+            "scope": "declared session-only units",
+            "units": list(units),
+            "process_list_observed": False,
+        }
+
+    active_lines = str(active_result.get("stdout", "")).splitlines()
+    enabled_lines = str(enabled_result.get("stdout", "")).splitlines()
+    states: dict[str, dict[str, str]] = {}
+    violations: list[str] = []
+    for index, unit in enumerate(units):
+        active = active_lines[index].strip() if index < len(active_lines) else "unknown"
+        enabled = enabled_lines[index].strip() if index < len(enabled_lines) else "unknown"
+        states[unit] = {"active": active, "enabled": enabled}
+        if active in {"active", "activating", "reloading"}:
+            violations.append(unit + " is active outside an authorized session")
+        if enabled in {"enabled", "enabled-runtime"}:
+            violations.append(unit + " is enabled at boot")
+    return {
+        "state": "passed" if not violations else "failed",
+        "scope": "declared session-only units",
+        "classes": {name: list(group) for name, group in SESSION_ONLY_UNITS.items()},
+        "units": states,
+        "violations": violations,
+        "process_list_observed": False,
+        "network_used": False,
+    }
+
+
+def _reproducibility_report() -> dict[str, Any]:
+    """Report source controls and remaining gates without creating a build."""
+
+    root = _repo_root()
+    if root is None:
+        return {
+            "state": "partial",
+            "reason": "runtime image has no checkout; inspect its build evidence externally",
+        }
+    desktop_root = root / "system" / "desktop"
+    generated = sorted(
+        item.relative_to(root).as_posix()
+        for item in desktop_root.rglob("*")
+        if item.is_file() and ("__pycache__" in item.parts or item.suffix in {".pyc", ".pyo"})
+    )
+    ignore_source = _safe_read(desktop_root / ".containerignore") or ""
+    exclusions_present = "**/__pycache__/**" in ignore_source and "**/*.pyc" in ignore_source
+    package_evidence = sorted((root / "build").glob("desktop-*/desktop-packages.lock.json")) if (root / "build").is_dir() else []
+    return {
+        "state": "foundation-passed" if exclusions_present else "failed",
+        "base_image_pinned_by_digest": "FROM quay.io/fedora/fedora-bootc@sha256:" in (_safe_read(desktop_root / "Containerfile") or ""),
+        "generated_inputs_excluded": exclusions_present,
+        "excluded_generated_files_present_locally": generated,
+        "package_inventory_evidence": [item.relative_to(root).as_posix() for item in package_evidence],
+        "remaining_release_gates": [
+            "capture the next package inventory",
+            "repeat from a clean checkout",
+            "compare two package inventories and qcow2 manifests",
+        ],
+        "writes_performed": False,
+        "network_used": False,
+    }
+
+
 def _validate_toml(path: Path) -> str | None:
     """Parse TOML with the stdlib when available, with a strict small fallback."""
 
@@ -419,7 +561,6 @@ def _validate_desktop_overlay(root: Path) -> tuple[list[str], list[str]]:
         "etc/skel/.config/kwinrc",
         "etc/skel/.config/kxkbrc",
         "etc/skel/.config/plasmarc",
-        "etc/xdg/autostart/aureon-apply-appearance.desktop",
         "usr/share/color-schemes/AureonLiquidGlass.colors",
     ):
         candidate = overlay / relative
@@ -468,6 +609,8 @@ def _validate_sources() -> dict[str, Any]:
         "packaging/driver-policy.json",
         "packaging/game-profile.schema.json",
         "packaging/appearance-profiles.json",
+        "packaging/display-profile.json",
+        "system/desktop/overlays/usr/share/plasma/look-and-feel/org.aureon.desktop/metadata.json",
         "system/desktop/overlays/usr/share/plasma/desktoptheme/AureonLiquidGlass/metadata.json",
         "system/desktop/overlays/usr/share/wallpapers/AureonLiquidGlass/metadata.json",
     )
@@ -497,14 +640,47 @@ def _validate_sources() -> dict[str, Any]:
     if "FROM quay.io/fedora/fedora-bootc@sha256:" not in (desktop.read_text(encoding="utf-8") if desktop.is_file() else ""):
         errors.append("system/desktop/Containerfile must pin the Fedora bootc base by digest")
     greetd = root / "system" / "desktop" / "overlays" / "etc" / "greetd" / "config.toml"
-    if "startplasma-wayland" not in (_safe_read(greetd) or ""):
-        errors.append("greetd must start the reviewed Wayland Plasma session")
+    greetd_source = _safe_read(greetd) or ""
+    if "aureon-plasma-session" not in greetd_source or "dbus-run-session" in greetd_source:
+        errors.append("greetd must use the reviewed Plasma session wrapper without forcing a nested D-Bus")
+    containerignore = root / "system" / "desktop" / ".containerignore"
+    ignore_source = _safe_read(containerignore) or ""
+    if "**/__pycache__/**" not in ignore_source or "**/*.pyc" not in ignore_source:
+        errors.append("system/desktop/.containerignore must exclude generated Python cache files")
+    ready_service = root / "system" / "desktop" / "overlays" / "usr" / "lib" / "systemd" / "system" / "aureon-desktop-ready.service"
+    ready_source = _safe_read(ready_service) or ""
+    if "aureon-wait-desktop-ready" not in ready_source or "ExecStart=/usr/bin/echo" in ready_source:
+        errors.append("desktop readiness must wait for the reviewed Plasma session probe")
+    session_probe = root / "system" / "desktop" / "overlays" / "usr" / "libexec" / "aureon" / "aureon-session-ready"
+    probe_source = _safe_read(session_probe) or ""
+    for requirement in ("kwin_wayland", "plasmashell", "org.freedesktop.DBus.Peer.Ping", "1920x1080"):
+        if requirement not in probe_source:
+            errors.append("desktop session probe is missing requirement: " + requirement)
+    plasma_launcher = root / "system" / "desktop" / "overlays" / "usr" / "libexec" / "aureon" / "aureon-plasma-session"
+    launcher_source = _safe_read(plasma_launcher) or ""
+    for requirement in ("plasma-dbus-run-session-if-needed", "startplasma-wayland"):
+        if requirement not in launcher_source:
+            errors.append("desktop Plasma launcher is missing requirement: " + requirement)
+    readiness_autostart = root / "system" / "desktop" / "overlays" / "etc" / "xdg" / "autostart" / "aureon-session-ready.desktop"
+    autostart_source = _safe_read(readiness_autostart) or ""
+    if "aureon-session-ready" not in autostart_source or "X-KDE-autostart-phase=2" not in autostart_source:
+        errors.append("desktop session readiness must be started by Plasma autostart")
+    display_kargs = root / "system" / "desktop" / "overlays" / "usr" / "lib" / "bootc" / "kargs.d" / "20-aureon-desktop-serial.toml"
+    if "video=" in (_safe_read(display_kargs) or ""):
+        errors.append("desktop kernel arguments must not force a mode rejected by virtual DRM")
     overlay_checks, overlay_errors = _validate_desktop_overlay(root)
     errors.extend(overlay_errors)
     return {
         "state": "passed" if not errors else "failed",
         "errors": errors,
-        "checked_files": list(relative_json) + list(required_docs) + overlay_checks,
+        "checked_files": list(relative_json) + list(required_docs) + [
+            containerignore.relative_to(root).as_posix(),
+            ready_service.relative_to(root).as_posix(),
+            session_probe.relative_to(root).as_posix(),
+            plasma_launcher.relative_to(root).as_posix(),
+            readiness_autostart.relative_to(root).as_posix(),
+            display_kargs.relative_to(root).as_posix(),
+        ] + overlay_checks,
     }
 
 
@@ -647,7 +823,16 @@ def build_parser() -> argparse.ArgumentParser:
     authority.add_argument("action", nargs="?", choices=sorted(ACTIONS))
 
     commands.add_parser("validate", help="validate local source contracts without writing")
+    commands.add_parser("reproducibility", help="inspect local reproducibility controls and remaining gates")
     commands.add_parser("baseline", help="collect a local baseline without storing or exporting it")
+
+    core = commands.add_parser("core", help="verify the minimal Aureon desktop package surface")
+    core_sub = core.add_subparsers(dest="core_command", required=True)
+    core_sub.add_parser("doctor", help="inspect required and prohibited core packages")
+
+    services = commands.add_parser("services", help="verify session-only services remain dormant")
+    services_sub = services.add_subparsers(dest="services_command", required=True)
+    services_sub.add_parser("doctor", help="inspect only the declared session-only units")
 
     hardware = commands.add_parser("hardware", help="local hardware diagnostics")
     hardware_sub = hardware.add_subparsers(dest="hardware_command", required=True)
@@ -700,8 +885,14 @@ def main(arguments: list[str] | None = None, output: TextIO | None = None) -> in
             _emit({"command": "authority", "actions": action}, output)
         elif args.command == "validate":
             _emit({"command": "validate", "result": _validate_sources()}, output)
+        elif args.command == "reproducibility":
+            _emit({"command": "reproducibility", "result": _reproducibility_report()}, output)
         elif args.command == "baseline":
             _emit({"command": "baseline", "result": _baseline_report(), "data_sent": False}, output)
+        elif args.command == "core":
+            _emit({"command": "core doctor", "result": _core_report()}, output)
+        elif args.command == "services":
+            _emit({"command": "services doctor", "result": _service_report()}, output)
         elif args.command == "hardware":
             _emit({"command": "hardware doctor", "result": _hardware_report()}, output)
         elif args.command == "driver":
