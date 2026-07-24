@@ -387,6 +387,11 @@ def build_parser():
         metavar="PATH",
         help="repository-local Phase 0 evidence JSON used for comparison",
     )
+    measurement_parser.add_argument(
+        "--reuse-base",
+        action="store_true",
+        help="build one immutable QCOW2 base and use a fresh copy-on-write overlay per run",
+    )
     measurement_mode = measurement_parser.add_mutually_exclusive_group()
     measurement_mode.add_argument(
         "--dry-run",
@@ -844,12 +849,32 @@ def load_measurement_baseline(path, repository_root=REPOSITORY_ROOT):
     return baseline, relative_repository_path(baseline_path, repository_root)
 
 
-def create_measurement_plan(run_id, runs, baseline_path, repository_root=REPOSITORY_ROOT):
+def create_measurement_plan(
+    run_id, runs, baseline_path, repository_root=REPOSITORY_ROOT, reuse_base=False
+):
     """Create a deterministic, read-only plan around existing smoke plans."""
 
     baseline, relative_baseline = load_measurement_baseline(baseline_path, repository_root)
     build_ids = measurement_build_ids(run_id, runs)
+    run_plans = []
+    shared_base = smoke_paths(build_ids[0], repository_root).disk
+    shared_base_path = relative_repository_path(shared_base, repository_root)
+    for index, build_id in enumerate(build_ids, start=1):
+        paths = smoke_paths(build_id, repository_root)
+        run_plans.append(
+            {
+                "build_id": build_id,
+                "overlay_backing_path": (
+                    shared_base_path
+                    if reuse_base
+                    else relative_repository_path(paths.disk, repository_root)
+                ),
+                "overlay_path": relative_repository_path(paths.overlay, repository_root),
+                "repetition": index,
+            }
+        )
     return {
+        "base_reuse_enabled": bool(reuse_base),
         "baseline": {
             "path": relative_baseline,
             "readiness_after_seconds": baseline["readiness_after_seconds"],
@@ -874,11 +899,9 @@ def create_measurement_plan(run_id, runs, baseline_path, repository_root=REPOSIT
             ],
         },
         "run_id": validate_build_id(run_id),
-        "runs": [
-            {"build_id": build_id, "repetition": index}
-            for index, build_id in enumerate(build_ids, start=1)
-        ],
+        "runs": run_plans,
         "schema": MEASUREMENT_SCHEMA + "-plan",
+        "shared_base_path": shared_base_path if reuse_base else None,
         "version": MEASUREMENT_VERSION,
     }
 
@@ -903,7 +926,30 @@ def _percentage_change(value, baseline):
     return ((value - baseline) / baseline) * 100.0
 
 
-def aggregate_measurement(run_id, requested, baseline_path, baseline, results):
+def verify_shared_base_hash(path, expected_sha256):
+    """Hash one regular QCOW2 base and fail closed on any mutation."""
+
+    base = Path(path)
+    if base.suffix != ".qcow2" or base.is_symlink() or not base.is_file():
+        raise SmokeRunnerError("shared base must be an existing regular QCOW2 image")
+    observed = _sha256_file(base)
+    if observed != expected_sha256:
+        raise SmokeRunnerError("the shared base QCOW2 hash changed; stopping immediately")
+    return observed
+
+
+def aggregate_measurement(
+    run_id,
+    requested,
+    baseline_path,
+    baseline,
+    results,
+    *,
+    base_reuse_enabled=False,
+    shared_base_path=None,
+    shared_base_sha256_before=None,
+    shared_base_sha256_after_each_run=None,
+):
     """Aggregate completed run records without timestamps or private paths."""
 
     completed = len(results)
@@ -930,7 +976,23 @@ def aggregate_measurement(run_id, requested, baseline_path, baseline, results):
         overall = "incomplete"
     else:
         overall = "passed"
+    hashes_after = list(shared_base_sha256_after_each_run or ())
+    shared_base_unchanged = bool(
+        base_reuse_enabled
+        and shared_base_sha256_before
+        and len(hashes_after) == completed
+        and all(value == shared_base_sha256_before for value in hashes_after)
+    )
+    backing_paths = {
+        result.get("overlay_backing_path") for result in results
+        if result.get("overlay_backing_path") is not None
+    }
+    base_images_identical = bool(
+        base_reuse_enabled and shared_base_unchanged and backing_paths == {shared_base_path}
+    )
     measurement = {
+        "base_images_identical_across_runs": base_images_identical,
+        "base_reuse_enabled": bool(base_reuse_enabled),
         "baseline": {
             "path": baseline_path,
             "readiness_after_seconds": baseline["readiness_after_seconds"],
@@ -939,6 +1001,13 @@ def aggregate_measurement(run_id, requested, baseline_path, baseline, results):
         "run_id": run_id,
         "runs": results,
         "schema": MEASUREMENT_SCHEMA,
+        "shared_base_path": shared_base_path,
+        "shared_base_sha256_after_each_run": hashes_after,
+        "shared_base_sha256_before": shared_base_sha256_before,
+        "shared_base_unchanged": shared_base_unchanged,
+        "suitable_as_final_boot_regression_baseline": bool(
+            overall == "passed" and completed == requested and base_images_identical
+        ),
         "summary": {
             "acceleration": sorted(
                 {result.get("acceleration") for result in results if result.get("acceleration")}
@@ -1604,6 +1673,9 @@ def execute_smoke_plan(
     timeout_seconds=SMOKE_TIMEOUT_DEFAULT_SECONDS,
     acceleration_policy="auto",
     repository_root=REPOSITORY_ROOT,
+    shared_base_path=None,
+    prepare_shared_base=True,
+    expected_base_sha256=None,
 ):
     """Execute the reviewed OCI -> qcow2 -> QEMU chain inside Linux/WSL only."""
 
@@ -1617,6 +1689,14 @@ def execute_smoke_plan(
         raise SmokeRunnerError("unsafe smoke execution input: {0}".format(error)) from error
     if paths.build_root.name != build_id:
         raise SmokeRunnerError("smoke plan build ID does not match its fixed artifact topology")
+    base_disk = paths.disk
+    if shared_base_path is not None:
+        try:
+            base_disk = repository_path(shared_base_path, "shared QCOW2 base", root)
+        except PlanValidationError as error:
+            raise SmokeRunnerError("unsafe shared base path: {0}".format(error)) from error
+        if base_disk.suffix != ".qcow2" or is_physical_disk_path(base_disk):
+            raise SmokeRunnerError("shared base must be a repository-local QCOW2 image")
     preflight = collect_smoke_runner_preflight(root, acceleration_policy)
     environment = _runner_environment()
     started_at = _utc_timestamp()
@@ -1627,6 +1707,8 @@ def execute_smoke_plan(
         "started_at_utc": started_at,
     }
     qemu_started = False
+    base_hash_before = None
+    base_hash_after = None
     try:
         _create_smoke_artifact_roots(paths, plan, root)
         _ensure_dedicated_runroot()
@@ -1642,7 +1724,8 @@ def execute_smoke_plan(
             str(PHASE0_PODMAN_RUNROOT),
         )
         tag = "localhost/aureon-phase0:{0}".format(plan["build_id"])
-        build_command = podman_prefix + (
+        if prepare_shared_base:
+            build_command = podman_prefix + (
             "build",
             "--pull=never",
             "--network=none",
@@ -1656,33 +1739,33 @@ def execute_smoke_plan(
             tag,
             str(root / "system"),
         )
-        build_stage = _run_logged_command(
-            build_command, paths.oci_build_log, SMOKE_STAGE_TIMEOUT_SECONDS, environment
-        )
-        derived_digest = _capture_command(
+            build_stage = _run_logged_command(
+                build_command, paths.oci_build_log, SMOKE_STAGE_TIMEOUT_SECONDS, environment
+            )
+            derived_digest = _capture_command(
             podman_prefix + ("image", "inspect", "--format", "{{.Digest}}", tag),
             60,
             environment,
         ).strip()
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", derived_digest):
-            raise SmokeRunnerError("derived OCI image did not expose a sha256 digest")
-        platform_name = _capture_command(
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", derived_digest):
+                raise SmokeRunnerError("derived OCI image did not expose a sha256 digest")
+            platform_name = _capture_command(
             podman_prefix + ("image", "inspect", "--format", "{{.Os}}/{{.Architecture}}", tag),
             60,
             environment,
         ).strip()
-        if platform_name != "linux/amd64":
-            raise SmokeRunnerError("derived OCI platform must be linux/amd64; observed '{0}'".format(platform_name))
-        image_id = _capture_command(
+            if platform_name != "linux/amd64":
+                raise SmokeRunnerError("derived OCI platform must be linux/amd64; observed '{0}'".format(platform_name))
+            image_id = _capture_command(
             podman_prefix + ("image", "inspect", "--format", "{{.Id}}", tag),
             60,
             environment,
         ).strip()
-        _, source_digest_after = declared_input_records(root)
-        if source_digest_after != plan["inputs"]["digest"]:
-            raise SmokeRunnerError("declared source inputs changed while the OCI was being built")
-        immutable_local_reference = "localhost/aureon-phase0@{0}".format(derived_digest)
-        _write_json_once(
+            _, source_digest_after = declared_input_records(root)
+            if source_digest_after != plan["inputs"]["digest"]:
+                raise SmokeRunnerError("declared source inputs changed while the OCI was being built")
+            immutable_local_reference = "localhost/aureon-phase0@{0}".format(derived_digest)
+            _write_json_once(
             paths.derived_oci,
             {
                 "build_id": plan["build_id"],
@@ -1707,9 +1790,9 @@ def execute_smoke_plan(
             },
         )
 
-        installed_storage = PHASE0_PODMAN_CONFIG_DIR / "storage.conf"
-        installed_containers = PHASE0_PODMAN_CONFIG_DIR / "containers.conf"
-        conversion_command = podman_prefix + (
+            installed_storage = PHASE0_PODMAN_CONFIG_DIR / "storage.conf"
+            installed_containers = PHASE0_PODMAN_CONFIG_DIR / "containers.conf"
+            conversion_command = podman_prefix + (
             "run",
             "--rm",
             "--privileged",
@@ -1745,11 +1828,11 @@ def execute_smoke_plan(
             "--progress",
             "verbose",
         )
-        conversion_stage = _run_logged_command(
-            conversion_command, paths.conversion_log, SMOKE_STAGE_TIMEOUT_SECONDS, environment
-        )
-        qcow2_details = _inspect_qcow2(paths, qemu_img, environment, root)
-        _write_json_once(
+            conversion_stage = _run_logged_command(
+                conversion_command, paths.conversion_log, SMOKE_STAGE_TIMEOUT_SECONDS, environment
+            )
+            qcow2_details = _inspect_qcow2(paths, qemu_img, environment, root)
+            _write_json_once(
             paths.qcow2_evidence,
             {
                 "build_id": plan["build_id"],
@@ -1765,13 +1848,17 @@ def execute_smoke_plan(
                 "status": "passed",
                 **qcow2_details,
             },
-        )
+            )
 
-        base_hash_before = _sha256_file(paths.disk)
+        if not base_disk.is_file() or base_disk.is_symlink():
+            raise SmokeRunnerError("shared base QCOW2 is unavailable or is not a regular file")
+        base_hash_before = _sha256_file(base_disk)
+        if expected_base_sha256 is not None:
+            verify_shared_base_hash(base_disk, expected_base_sha256)
         shutil.copyfile(PHASE0_OVMF_VARS, paths.vars_copy)
         overlay_create_log = paths.work_root / "overlay-create.log"
         _run_logged_command(
-            (qemu_img, "create", "-f", "qcow2", "-F", "qcow2", "-b", str(paths.disk), str(paths.overlay)),
+            (qemu_img, "create", "-f", "qcow2", "-F", "qcow2", "-b", str(base_disk), str(paths.overlay)),
             overlay_create_log,
             120,
             environment,
@@ -1819,7 +1906,7 @@ def execute_smoke_plan(
         if assertions["serial_kernel_arguments_line"] is None:
             raise SmokeRunnerError("serial log does not prove the required ttyS0 kernel argument")
         overlay_integrity = _capture_command((qemu_img, "check", str(paths.overlay)), 120, environment).strip()
-        base_hash_after = _sha256_file(paths.disk)
+        base_hash_after = _sha256_file(base_disk)
         if base_hash_before != base_hash_after:
             raise SmokeRunnerError("the base qcow2 hash changed during QEMU smoke; refusing to report success")
         _write_json_once(
@@ -1840,6 +1927,7 @@ def execute_smoke_plan(
                     "guest_network": "none",
                     "host_directories_mounted_in_guest": False,
                     "memory_mib": SMOKE_MEMORY_MIB,
+                    "overlay_backing_path": relative_repository_path(base_disk, root),
                     "overlay_integrity_check": overlay_integrity or "qemu-img check exited 0",
                     "vcpus": SMOKE_VCPUS,
                 },
@@ -1877,6 +1965,11 @@ def execute_smoke_plan(
                     {
                         "build_id": plan["build_id"],
                         "error": str(error),
+                        "qemu": {
+                            "base_sha256_after": base_hash_after,
+                            "base_sha256_before": base_hash_before,
+                            "overlay_backing_path": relative_repository_path(base_disk, root),
+                        },
                         "status": "failed",
                         "timeout_seconds": timeout_seconds,
                     },
@@ -1896,7 +1989,14 @@ def _optional_artifact_record(path, repository_root):
         return {"path": relative_repository_path(path, repository_root), "sha256": None, "size_bytes": None}
 
 
-def measurement_run_record(build_id, paths, status, repository_root=REPOSITORY_ROOT, error=None):
+def measurement_run_record(
+    build_id,
+    paths,
+    status,
+    repository_root=REPOSITORY_ROOT,
+    error=None,
+    overlay_backing_path=None,
+):
     """Normalize one test-smoke evidence set into the Phase 1 run schema."""
 
     smoke = {}
@@ -1908,10 +2008,16 @@ def measurement_run_record(build_id, paths, status, repository_root=REPOSITORY_R
     qemu = smoke.get("qemu", {})
     scope = smoke.get("scope", {})
     artifacts = smoke.get("artifacts", {})
+    backing_path = (
+        overlay_backing_path
+        or qemu.get("overlay_backing_path")
+        or relative_repository_path(paths.disk, repository_root)
+    )
+    backing_file = repository_path(backing_path, "overlay backing path", repository_root)
     record = {
         "acceleration": qemu.get("acceleration"),
         "artifacts": {
-            "base_qcow2": _optional_artifact_record(paths.disk, repository_root),
+            "base_qcow2": _optional_artifact_record(backing_file, repository_root),
             "overlay": artifacts.get("overlay")
             or _optional_artifact_record(paths.overlay, repository_root),
             "qemu_log": artifacts.get("qemu_log")
@@ -1927,6 +2033,8 @@ def measurement_run_record(build_id, paths, status, repository_root=REPOSITORY_R
         ),
         "memory_mib": qemu.get("memory_mib", SMOKE_MEMORY_MIB),
         "overlay_integrity": qemu.get("overlay_integrity_check"),
+        "overlay_backing_path": backing_path,
+        "overlay_path": relative_repository_path(paths.overlay, repository_root),
         "physical_block_devices_accessed": scope.get(
             "physical_block_devices_accessed", False
         ),
@@ -1994,6 +2102,12 @@ def execute_measurement(plan, baseline, baseline_path, repository_root=REPOSITOR
             )
         )
     results = []
+    shared_base = None
+    shared_base_hash = None
+    hashes_after = []
+    reuse_base = bool(plan.get("base_reuse_enabled"))
+    if reuse_base:
+        shared_base = repository_path(plan.get("shared_base_path"), "shared QCOW2 base", root)
     try:
         runs_root.mkdir(parents=True, exist_ok=False)
         for index, planned_run in enumerate(plan["runs"], start=1):
@@ -2002,19 +2116,66 @@ def execute_measurement(plan, baseline, baseline_path, repository_root=REPOSITOR
             smoke_plan = create_smoke_plan(build_id, repository_root=root)
             status = "passed"
             error = None
+            smoke_result = None
             try:
                 require_unused_smoke_output_roots(paths, root)
-                execute_smoke_plan(smoke_plan, paths, repository_root=root)
+                smoke_result = execute_smoke_plan(
+                    smoke_plan,
+                    paths,
+                    repository_root=root,
+                    shared_base_path=shared_base if reuse_base else None,
+                    prepare_shared_base=not reuse_base or index == 1,
+                    expected_base_sha256=shared_base_hash,
+                )
             except (PlanValidationError, SmokeRunnerError) as run_error:
                 status = "failed"
                 error = run_error
-            record = measurement_run_record(build_id, paths, status, root, error)
+            if reuse_base and shared_base is not None and shared_base.is_file():
+                observed_hash = _sha256_file(shared_base)
+                if shared_base_hash is None:
+                    failed_before = None
+                    if paths.smoke.is_file() and not paths.smoke.is_symlink():
+                        try:
+                            failed_smoke = json.loads(paths.smoke.read_text(encoding="utf-8"))
+                            failed_before = failed_smoke.get("qemu", {}).get(
+                                "base_sha256_before"
+                            )
+                        except (OSError, UnicodeError, json.JSONDecodeError):
+                            failed_before = None
+                    shared_base_hash = (
+                        smoke_result.get("qcow2_sha256")
+                        if isinstance(smoke_result, dict)
+                        else failed_before or observed_hash
+                    )
+                hashes_after.append(observed_hash)
+                if observed_hash != shared_base_hash:
+                    status = "failed"
+                    error = SmokeRunnerError(
+                        "the shared base QCOW2 hash changed after repetition {0}; "
+                        "stopping immediately".format(index)
+                    )
+            record = measurement_run_record(
+                build_id,
+                paths,
+                status,
+                root,
+                error,
+                planned_run.get("overlay_backing_path"),
+            )
             results.append(record)
             _write_json_once(runs_root / "r{0:02d}.json".format(index), record)
             if status == "failed":
                 break
         measurement = aggregate_measurement(
-            plan["run_id"], len(plan["runs"]), baseline_path, baseline, results
+            plan["run_id"],
+            len(plan["runs"]),
+            baseline_path,
+            baseline,
+            results,
+            base_reuse_enabled=reuse_base,
+            shared_base_path=plan.get("shared_base_path"),
+            shared_base_sha256_before=shared_base_hash,
+            shared_base_sha256_after_each_run=hashes_after,
         )
         _write_json_once(measurement_root / "measurement.json", measurement)
         try:
@@ -2029,13 +2190,15 @@ def execute_measurement(plan, baseline, baseline_path, repository_root=REPOSITOR
         raise SmokeRunnerError("could not preserve measurement evidence: {0}".format(error)) from error
 
 
-def run_measurement(workspace, run_id, runs, baseline_path, execution_mode, output):
+def run_measurement(
+    workspace, run_id, runs, baseline_path, reuse_base, execution_mode, output
+):
     """Print a no-write measurement plan or execute it without elevation."""
 
     try:
         inspection_scope = canonical_workspace(workspace)
         baseline, relative_baseline = load_measurement_baseline(baseline_path)
-        plan = create_measurement_plan(run_id, runs, baseline_path)
+        plan = create_measurement_plan(run_id, runs, baseline_path, reuse_base=reuse_base)
     except WorkspaceScopeError as error:
         return report_workspace_rejection(error, output)
     except PlanValidationError as error:
@@ -2661,6 +2824,7 @@ def main(argv=None, stdout=None):
             args.run_id,
             args.runs,
             args.baseline,
+            args.reuse_base,
             args.execution_mode,
             output,
         )
