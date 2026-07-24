@@ -6,8 +6,8 @@ estado de las fases 0–32 sin cambiar nada.
 
 | Bloque | Fundamento entregado | Pendiente real |
 | --- | --- | --- |
-| 0–3 | Autoridad, recuperación, manifiestos, validación y baseline local. | Repetir builds limpios y medir en hardware. |
-| 4–6 | Perfil KDE mínimo, tema, clases de servicios. | Ajustar tamaño/RAM tras medir una sesión real. |
+| 0–3 | Autoridad, recuperación, fuentes filtradas, inventario RPM y baseline local ampliado. | Construir una imagen nueva, repetir desde checkout limpio y medir en hardware. |
+| 4–6 | Core auditable, Liquid Glass, solicitud/observación 1920×1080 y auditoría de servicios dormidos. | Validar visualmente y conservar los informes automáticos del guest. |
 | 7–10 | Política de recursos y clasificación de datos. | Aplicación cgroup/zram tras pruebas por hardware. |
 | 11–14 | Diagnósticos locales y política de drivers. | Matriz AMD/Intel/NVIDIA, periféricos y pantallas. |
 | 15–16 | Política de kernel y detección de `ntsync`. | Kernel/Proton medido en hardware. |
@@ -18,3 +18,5 @@ estado de las fases 0–32 sin cambiar nada.
 
 Los estados detallados y el enlace a la evidencia de cada fase viven en
 [`packaging/aureon-control-plane.json`](../packaging/aureon-control-plane.json).
+El protocolo de la próxima validación conjunta está en
+[`docs/testing/phase-2-6-validation.md`](testing/phase-2-6-validation.md).

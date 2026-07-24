@@ -7,13 +7,15 @@ imagen base.
 
 ## Estado que se preserva
 
-- `images/desktop-preview-08/aureon-desktop.qcow2` es el primer escritorio
-  conservado.
-- `images/desktop-preview-09/aureon-desktop.qcow2` es una segunda conversión
-  validada.
+- El código recuperable está etiquetado como
+  `aureon-liquid-glass-v0.2.0`; los cambios posteriores permanecen en la rama
+  de trabajo hasta superar la próxima validación.
+- `preview-10` es evidencia histórica con readiness antiguo. `preview-13`
+  llegó a `qcow2` y QEMU, pero falló el contrato gráfico; ninguna se acepta en
+  `--run-existing` como escritorio usable.
 - Los hashes, logs y manifiestos asociados viven bajo `build/desktop-*`.
-- La sesión escribible de cada preview solo está en
-  `work/qemu-desktop/<id>/desktop-overlay.qcow2`.
+- Cada sesión nueva usa su propio overlay en
+  `work/qemu-desktop/<id>/sessions/<session-id>/desktop-overlay.qcow2`.
 
 Los artefactos grandes están ignorados por Git deliberadamente. El código,
 overlays y políticas son lo que se versiona y permite reconstruirlos.
@@ -22,12 +24,13 @@ overlays y políticas son lo que se versiona y permite reconstruirlos.
 
 1. Ejecuta `python3 tools/aureonctl validate` desde el checkout para comprobar
    los contratos fuente sin escribir nada.
-2. Conserva una carpeta `images/desktop-<id>/` que haya pasado `qcow2.json`.
-3. No reutilices un build ID para una compilación nueva: el launcher rechaza
-   sobrescribir evidencia o discos existentes.
-4. Para una nueva prueba, usa otro ID. El disco base anterior permanecerá
-   intacto.
+2. Conserva una carpeta `images/desktop-<id>/` que tenga evidencia
+   `qcow2.json` con estado `passed`.
+3. No reutilices un build ID ni un session ID: el launcher rechaza sobrescribir
+   evidencia o discos existentes.
+4. Para una build nueva usa otro ID. La imagen base anterior permanece intacta.
+5. Para regresar al último código etiquetado, crea una rama aparte desde el tag;
+   no borres ni sobrescribas el trabajo actual.
 
-No hay comando de limpieza automática. El borrado de imágenes queda fuera de
-la automatización hasta que exista una confirmación explícita y una revisión de
-espacio disponible.
+No hay limpieza automática. El borrado de imágenes exige una decisión
+explícita y rutas exactas dentro de `build/`, `images/` y `work/qemu-desktop/`.
