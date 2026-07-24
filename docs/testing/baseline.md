@@ -26,3 +26,11 @@ harness `measure-smoke` carga de él `readiness_after_seconds` y
 `wall_duration_seconds` para calcular la variación porcentual de las medias de
 un lote nuevo. También agrega mínimo, máximo, media y mediana de readiness,
 duración total y tamaño de overlay, sin alterar los valores Phase 0.
+
+Para producir un candidato final comparable, se usa `measure-smoke
+--reuse-base`: una sola base QCOW2 inmutable alimenta overlays independientes
+para todas las repeticiones. Un lote solo se marca
+`suitable_as_final_boot_regression_baseline` cuando se completan y pasan todas
+las repeticiones, todas declaran el mismo backing file y el SHA-256 de la base
+coincide después de cada arranque. Un fallo o una mutación conserva la evidencia
+parcial, pero invalida el lote como baseline final.
