@@ -5,6 +5,10 @@ __pycache__/
 .coverage
 coverage.xml
 
+# Local Codex workspace state
+/.agents/
+/.codex-tools/
+
 # Local development state and secrets
 .env
 .env.*
@@ -32,7 +36,7 @@ secrets/
 /images/*
 !/images/README.md
 /work/*
-/outputs/*
+/outputs/
 
 # Container and operating-system artifacts
 *.oci.tar
@@ -44,8 +48,5 @@ secrets/
 Thumbs.db
 Desktop.ini
 .DS_Store
-/build/
-/images/
-/work/
 *.pyc
 .mypy_cache/
