@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import importlib.machinery
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -18,6 +20,7 @@ OVERLAY = ROOT / "system" / "desktop" / "overlays"
 SESSION_PROBE = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-session-ready"
 SYSTEM_PROBE = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-wait-desktop-ready"
 READY_SERVICE = OVERLAY / "usr" / "lib" / "systemd" / "system" / "aureon-desktop-ready.service"
+READY_TMPFILES = OVERLAY / "usr" / "lib" / "tmpfiles.d" / "aureon-desktop-ready.conf"
 PLASMA_LAUNCHER = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-plasma-session"
 DISPLAY_PROBE = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-display"
 LAYOUT_PROBE = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-plasma-layout-ready"
@@ -62,7 +65,111 @@ class DesktopReadinessTests(unittest.TestCase):
         plasma_start = launcher.index("/usr/bin/startplasma-wayland")
 
         self.assertLess(probe_start, plasma_start)
-        self.assertIn("session-probe.lock", SESSION_PROBE.read_text(encoding="utf-8"))
+        self.assertEqual(launcher.count("/usr/libexec/aureon/aureon-session-ready &"), 1)
+        self.assertIn("probe_pid=$!", launcher)
+        self.assertIn('kill -0 "$probe_pid"', launcher)
+        self.assertIn("probe-exited-without-state", launcher)
+
+    def test_probe_lock_is_owned_and_duplicate_cannot_remove_valid_lock(self):
+        session = SESSION_PROBE.read_text(encoding="utf-8")
+
+        self.assertIn('probe_lock="${state_dir}/session-probe.lock"', session)
+        self.assertIn('probe_owner="${probe_lock}/pid"', session)
+        duplicate = session.index('if ! mkdir "$probe_lock"')
+        owner_write = session.index("printf '%s\\n' \"$$\" > \"$probe_owner\"")
+        trap_install = session.index("trap cleanup_lock EXIT")
+        self.assertLess(duplicate, owner_write)
+        self.assertLess(owner_write, trap_install)
+        self.assertNotIn("trap 'rmdir", session)
+        self.assertIn("duplicate-probe owner_pid=", session)
+
+    def test_state_publication_is_atomic_and_private(self):
+        session = SESSION_PROBE.read_text(encoding="utf-8")
+
+        self.assertIn('temporary_file="${state_dir}/session-state.$$"', session)
+        self.assertIn('chmod 0600 "$temporary_file"', session)
+        self.assertIn('mv -f "$temporary_file" "$state_file"', session)
+        self.assertIn("state-write-failed", session)
+        self.assertIn("state-publish-failed", session)
+
+    def test_session_and_system_consumer_share_stable_private_runtime_directory(self):
+        launcher = PLASMA_LAUNCHER.read_text(encoding="utf-8")
+        session = SESSION_PROBE.read_text(encoding="utf-8")
+        bridge = SYSTEM_PROBE.read_text(encoding="utf-8")
+        service = READY_SERVICE.read_text(encoding="utf-8")
+
+        state_default = "${AUREON_DESKTOP_STATE_DIR:-/run/aureon-desktop-ready}"
+        for source in (launcher, session, bridge):
+            self.assertIn(state_default, source)
+        self.assertNotIn("/run/user/1000/aureon", bridge)
+        self.assertIn("RuntimeDirectory=aureon-desktop-ready", service)
+        self.assertIn("RuntimeDirectoryMode=0700", service)
+        self.assertIn("User=aureon", service)
+        self.assertIn("Group=aureon", service)
+        self.assertEqual(
+            READY_TMPFILES.read_text(encoding="utf-8").strip(),
+            "d /run/aureon-desktop-ready 0700 aureon aureon -",
+        )
+
+    def test_consumer_reads_private_state_and_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            (state_dir / "session-state").write_text(
+                "probe_state=passed\nfailure_reason=none\n", encoding="utf-8"
+            )
+            (state_dir / "session-ready").touch()
+            for report in ("baseline", "core", "services"):
+                (state_dir / f"{report}.json").write_text(
+                    '{"status":"ready"}\n', encoding="utf-8"
+                )
+            os.chmod(state_dir, 0o700)
+            environment = {
+                **os.environ,
+                "AUREON_DESKTOP_STATE_DIR": str(state_dir),
+            }
+            result = subprocess.run(
+                ["/bin/sh", str(SYSTEM_PROBE)],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("probe_state=passed", result.stdout)
+        self.assertIn("AUREON_DESKTOP_READY", result.stdout)
+
+    def test_absent_probe_has_immediate_explicit_reason_when_state_directory_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "not-created"
+            environment = {
+                **os.environ,
+                "AUREON_DESKTOP_STATE_DIR": str(missing),
+            }
+            first = subprocess.run(
+                ["/bin/sh", str(SYSTEM_PROBE)],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            second = subprocess.run(
+                ["/bin/sh", str(SYSTEM_PROBE)],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+
+        self.assertEqual(first.returncode, 1)
+        self.assertEqual(first.stderr, second.stderr)
+        self.assertIn("reason=state-directory-missing", first.stderr)
 
     def test_ready_marker_requires_responsive_kwin_and_plasma(self):
         session = SESSION_PROBE.read_text(encoding="utf-8")
@@ -74,6 +181,8 @@ class DesktopReadinessTests(unittest.TestCase):
         self.assertIn("plasmashell", session)
         self.assertIn("org.freedesktop.DBus.Peer.Ping", session)
         self.assertIn("aureon-plasma-layout-ready", session)
+        self.assertIn('fail_probe "plasma-panel-layout-invalid"', session)
+        self.assertIn("panel-observation=", session)
         self.assertTrue(LAYOUT_PROBE.is_file())
         self.assertNotIn("AUREON_DESKTOP_READY", session)
         self.assertIn("session-ready", bridge)
@@ -85,6 +194,7 @@ class DesktopReadinessTests(unittest.TestCase):
         self.assertIn("TimeoutStartSec=300", service)
         self.assertNotIn("ExecStart=/usr/bin/echo", service)
         self.assertIn("probe_state=failed", bridge)
+        self.assertIn("reason=probe-state-missing", bridge)
         self.assertIn("AUREON_DESKTOP_DIAGNOSTICS_BEGIN", bridge)
         self.assertIn("aureon-session-ready", READINESS_AUTOSTART.read_text(encoding="utf-8"))
 

@@ -6,8 +6,7 @@ if [ "$(id -un)" != "aureon" ]; then
     exit 1
 fi
 
-runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-state_dir="${runtime_dir}/aureon"
+state_dir="${AUREON_DESKTOP_STATE_DIR:-/run/aureon-desktop-ready}"
 state_file="${state_dir}/session-state"
 ready_file="${state_dir}/session-ready"
 temporary_file="${state_dir}/session-state.$$"
@@ -15,7 +14,9 @@ kscreen_before="${state_dir}/kscreen-before.json"
 kscreen_after="${state_dir}/kscreen-after.json"
 kscreen_error="${state_dir}/kscreen-error.txt"
 display_observation="${state_dir}/display-observation.json"
+panel_observation="${state_dir}/panel-observation.json"
 probe_lock="${state_dir}/session-probe.lock"
+probe_owner="${probe_lock}/pid"
 probe_state="running"
 session_state="waiting-for-plasma"
 kwin_state="not-observed"
@@ -24,13 +25,30 @@ display_state="not-observed"
 appearance_state="not-applied"
 failure_reason="none"
 umask 077
-install -d -m 0700 "$state_dir"
+if ! install -d -m 0700 "$state_dir"; then
+    printf 'aureon-session-ready: state-directory-create-failed path=%s\n' "$state_dir" >&2
+    exit 1
+fi
 if ! mkdir "$probe_lock" 2>/dev/null; then
+    if [ -r "$probe_owner" ]; then
+        printf 'aureon-session-ready: duplicate-probe owner_pid=%s\n' "$(cat "$probe_owner")" >&2
+    else
+        printf 'aureon-session-ready: duplicate-probe owner_pid=unknown\n' >&2
+    fi
     exit 0
 fi
-trap 'rmdir "$probe_lock" 2>/dev/null || true' EXIT HUP INT TERM
+printf '%s\n' "$$" > "$probe_owner"
+chmod 0600 "$probe_owner"
+cleanup_lock() {
+    rm -f "$probe_owner"
+    rmdir "$probe_lock" 2>/dev/null || true
+}
+trap cleanup_lock EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 rm -f "$ready_file" "$state_file" "$kscreen_before" "$kscreen_after" \
-    "$kscreen_error" "$display_observation" \
+    "$kscreen_error" "$display_observation" "$panel_observation" \
     "${state_dir}/baseline.json" "${state_dir}/core.json" "${state_dir}/services.json"
 
 write_state() {
@@ -49,9 +67,17 @@ write_state() {
         if [ -s "$kscreen_error" ]; then
             sed 's/^/kscreen_error=/' "$kscreen_error" | head -n 20
         fi
-    } > "$temporary_file"
-    chmod 0600 "$temporary_file"
-    mv -f "$temporary_file" "$state_file"
+    } > "$temporary_file" || {
+        printf 'aureon-session-ready: state-write-failed path=%s\n' "$temporary_file" >&2
+        rm -f "$temporary_file"
+        return 1
+    }
+    chmod 0600 "$temporary_file" &&
+        mv -f "$temporary_file" "$state_file" || {
+        printf 'aureon-session-ready: state-publish-failed path=%s\n' "$state_file" >&2
+        rm -f "$temporary_file"
+        return 1
+    }
 }
 
 fail_probe() {
@@ -61,7 +87,9 @@ fail_probe() {
     exit 1
 }
 
-write_state
+if ! write_state; then
+    exit 1
+fi
 
 dbus_tool=""
 if command -v busctl >/dev/null 2>&1; then
@@ -112,7 +140,10 @@ else
 fi
 write_state
 
-if ! /usr/libexec/aureon/aureon-plasma-layout-ready; then
+if ! /usr/libexec/aureon/aureon-plasma-layout-ready > "$panel_observation"; then
+    if [ -s "$panel_observation" ]; then
+        sed 's/^/aureon-session-ready: panel-observation=/' "$panel_observation" >&2
+    fi
     fail_probe "plasma-panel-layout-invalid"
 fi
 

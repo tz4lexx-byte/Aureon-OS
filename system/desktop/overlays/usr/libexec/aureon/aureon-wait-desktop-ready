@@ -2,7 +2,7 @@
 # System-side bridge from the Plasma session probe to serial evidence.
 set -u
 
-state_dir="/run/user/1000/aureon"
+state_dir="${AUREON_DESKTOP_STATE_DIR:-/run/aureon-desktop-ready}"
 state_file="${state_dir}/session-state"
 ready_file="${state_dir}/session-ready"
 attempt=0
@@ -32,6 +32,15 @@ emit_diagnostics() {
     printf 'AUREON_DESKTOP_DIAGNOSTICS_END\n' >&2
 }
 
+if [ ! -d "$state_dir" ]; then
+    printf 'AUREON_DESKTOP_NOT_READY reason=state-directory-missing path=%s\n' "$state_dir" >&2
+    exit 1
+fi
+if [ ! -r "$state_dir" ] || [ ! -x "$state_dir" ]; then
+    printf 'AUREON_DESKTOP_NOT_READY reason=state-directory-unreadable path=%s\n' "$state_dir" >&2
+    exit 1
+fi
+
 while [ "$attempt" -lt 240 ]; do
     if [ -f "$ready_file" ] && [ -r "$state_file" ]; then
         cat "$state_file"
@@ -58,5 +67,9 @@ while [ "$attempt" -lt 240 ]; do
 done
 
 emit_diagnostics
-printf 'AUREON_DESKTOP_NOT_READY\n' >&2
+if [ ! -r "$state_file" ]; then
+    printf 'AUREON_DESKTOP_NOT_READY reason=probe-state-missing\n' >&2
+else
+    printf 'AUREON_DESKTOP_NOT_READY reason=probe-timeout\n' >&2
+fi
 exit 1
