@@ -12,5 +12,6 @@ panel.addWidget("org.kde.plasma.pager");
 panel.addWidget("org.kde.plasma.icontasks");
 panel.addWidget("org.kde.plasma.marginsseparator");
 panel.addWidget("org.kde.plasma.systemtray");
+panel.addWidget("org.aureon.systemoverview");
 panel.addWidget("org.kde.plasma.digitalclock");
 panel.addWidget("org.kde.plasma.showdesktop");

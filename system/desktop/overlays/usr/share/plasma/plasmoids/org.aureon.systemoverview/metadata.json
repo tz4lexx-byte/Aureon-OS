@@ -1,0 +1,10 @@
+{
+  "KPlugin": {
+    "Id": "org.aureon.systemoverview",
+    "Name": "Aureon System Overview",
+    "Description": "Read-only overview of this Aureon OS system",
+    "Icon": "computer-symbolic"
+  },
+  "KPackageStructure": "Plasma/Applet",
+  "X-Plasma-API-Minimum-Version": "6.0"
+}
