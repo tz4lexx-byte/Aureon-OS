@@ -1,0 +1,178 @@
+{
+  "base_images_identical_across_runs": true,
+  "base_reuse_enabled": true,
+  "baseline": {
+    "build_id": "phase0-review-20260724t164040z",
+    "path": "docs/testing/phase0-review-20260724t164040z.json",
+    "readiness_after_seconds": 63.733,
+    "wall_duration_seconds": 75.488
+  },
+  "classification": "final-boot-regression-baseline",
+  "completed": 3,
+  "failed": 0,
+  "isolation": {
+    "base_storage_mode": "shared immutable QCOW2 backing file with an independent copy-on-write overlay per run",
+    "guest_network": "none",
+    "host_directories_mounted_in_guest": false,
+    "physical_block_devices_accessed": false,
+    "windows_install_or_boot_changes": false
+  },
+  "passed": 3,
+  "requested": 3,
+  "run_id": "phase1-immutable-20260724",
+  "runs": [
+    {
+      "acceleration": "kvm",
+      "artifacts": {
+        "base_qcow2": {
+          "path": "images/phase1-immutable-20260724-r01/aureon-base.qcow2",
+          "sha256": "af623a046c3f3fecce8fd39b4262efbe0724b543013cafe3ef2da355a03b7221",
+          "size_bytes": 1308295168
+        },
+        "overlay": {
+          "path": "work/qemu/phase1-immutable-20260724-r01/smoke-overlay.qcow2",
+          "sha256": "ccd1d77232b7f45ed6612da1a3439a56970e67a912be0d37fa8ca18e950d4a3c",
+          "size_bytes": 24510464
+        },
+        "qemu_log": {
+          "path": "work/qemu/phase1-immutable-20260724-r01/qemu.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0
+        },
+        "serial_log": {
+          "path": "work/qemu/phase1-immutable-20260724-r01/serial.log",
+          "sha256": "459399675b6855ae3937938941f60fbbca8093393c67fcaa45da10d6ce83ee74",
+          "size_bytes": 112938
+        }
+      },
+      "base_sha256_before_and_after": "af623a046c3f3fecce8fd39b4262efbe0724b543013cafe3ef2da355a03b7221",
+      "build_id": "phase1-immutable-20260724-r01",
+      "memory_mib": 4096,
+      "overlay_backing_path": "images/phase1-immutable-20260724-r01/aureon-base.qcow2",
+      "overlay_path": "work/qemu/phase1-immutable-20260724-r01/smoke-overlay.qcow2",
+      "readiness_after_seconds": 66.058,
+      "source_path": "work/measurements/phase1-immutable-20260724/runs/r01.json",
+      "status": "passed",
+      "vcpus": 2,
+      "wall_duration_seconds": 80.317
+    },
+    {
+      "acceleration": "kvm",
+      "artifacts": {
+        "base_qcow2": {
+          "path": "images/phase1-immutable-20260724-r01/aureon-base.qcow2",
+          "sha256": "af623a046c3f3fecce8fd39b4262efbe0724b543013cafe3ef2da355a03b7221",
+          "size_bytes": 1308295168
+        },
+        "overlay": {
+          "path": "work/qemu/phase1-immutable-20260724-r02/smoke-overlay.qcow2",
+          "sha256": "bcfa8a245c7a8f71a0739b2978d27ff9036005a99d0449ec8760b964b799bf85",
+          "size_bytes": 24444928
+        },
+        "qemu_log": {
+          "path": "work/qemu/phase1-immutable-20260724-r02/qemu.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0
+        },
+        "serial_log": {
+          "path": "work/qemu/phase1-immutable-20260724-r02/serial.log",
+          "sha256": "f80994cd7995b75d955e3935ebeb7c49a9b3b219ae1bd00781c20528b6be3458",
+          "size_bytes": 112914
+        }
+      },
+      "base_sha256_before_and_after": "af623a046c3f3fecce8fd39b4262efbe0724b543013cafe3ef2da355a03b7221",
+      "build_id": "phase1-immutable-20260724-r02",
+      "memory_mib": 4096,
+      "overlay_backing_path": "images/phase1-immutable-20260724-r01/aureon-base.qcow2",
+      "overlay_path": "work/qemu/phase1-immutable-20260724-r02/smoke-overlay.qcow2",
+      "readiness_after_seconds": 73.803,
+      "source_path": "work/measurements/phase1-immutable-20260724/runs/r02.json",
+      "status": "passed",
+      "vcpus": 2,
+      "wall_duration_seconds": 87.062
+    },
+    {
+      "acceleration": "kvm",
+      "artifacts": {
+        "base_qcow2": {
+          "path": "images/phase1-immutable-20260724-r01/aureon-base.qcow2",
+          "sha256": "af623a046c3f3fecce8fd39b4262efbe0724b543013cafe3ef2da355a03b7221",
+          "size_bytes": 1308295168
+        },
+        "overlay": {
+          "path": "work/qemu/phase1-immutable-20260724-r03/smoke-overlay.qcow2",
+          "sha256": "b7c2e94afa0d7b8723bb59720f6fda6cf105be54d5723a89f288af1c5ac825ec",
+          "size_bytes": 24444928
+        },
+        "qemu_log": {
+          "path": "work/qemu/phase1-immutable-20260724-r03/qemu.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0
+        },
+        "serial_log": {
+          "path": "work/qemu/phase1-immutable-20260724-r03/serial.log",
+          "sha256": "028a793563bdafb4c89588ee2f9da0f6311867b5db80590303f75424a4ca8c13",
+          "size_bytes": 113231
+        }
+      },
+      "base_sha256_before_and_after": "af623a046c3f3fecce8fd39b4262efbe0724b543013cafe3ef2da355a03b7221",
+      "build_id": "phase1-immutable-20260724-r03",
+      "memory_mib": 4096,
+      "overlay_backing_path": "images/phase1-immutable-20260724-r01/aureon-base.qcow2",
+      "overlay_path": "work/qemu/phase1-immutable-20260724-r03/smoke-overlay.qcow2",
+      "readiness_after_seconds": 75.544,
+      "source_path": "work/measurements/phase1-immutable-20260724/runs/r03.json",
+      "status": "passed",
+      "vcpus": 2,
+      "wall_duration_seconds": 90.053
+    }
+  ],
+  "schema_version": 1,
+  "shared_base_path": "images/phase1-immutable-20260724-r01/aureon-base.qcow2",
+  "shared_base_sha256_after_each_run": [
+    "af623a046c3f3fecce8fd39b4262efbe0724b543013cafe3ef2da355a03b7221",
+    "af623a046c3f3fecce8fd39b4262efbe0724b543013cafe3ef2da355a03b7221",
+    "af623a046c3f3fecce8fd39b4262efbe0724b543013cafe3ef2da355a03b7221"
+  ],
+  "shared_base_sha256_before": "af623a046c3f3fecce8fd39b4262efbe0724b543013cafe3ef2da355a03b7221",
+  "shared_base_unchanged": true,
+  "source_evidence": {
+    "baseline_documentation": "docs/testing/baseline.md",
+    "benchmark_protocol": "docs/testing/benchmark-protocol.md",
+    "exploratory_phase1_baseline": "docs/testing/phase1-baseline-20260724.json",
+    "measurement_json": "work/measurements/phase1-immutable-20260724/measurement.json",
+    "measurement_markdown": "work/measurements/phase1-immutable-20260724/measurement.md",
+    "phase0_baseline": "docs/testing/phase0-review-20260724t164040z.json",
+    "run_results": [
+      "work/measurements/phase1-immutable-20260724/runs/r01.json",
+      "work/measurements/phase1-immutable-20260724/runs/r02.json",
+      "work/measurements/phase1-immutable-20260724/runs/r03.json"
+    ]
+  },
+  "statistics": {
+    "duration_seconds": {
+      "maximum": 90.053,
+      "mean": 85.81066666666668,
+      "median": 87.062,
+      "minimum": 80.317
+    },
+    "overlay_size_bytes": {
+      "maximum": 24510464.0,
+      "mean": 24466773.333333332,
+      "median": 24444928.0,
+      "minimum": 24444928.0
+    },
+    "readiness_seconds": {
+      "maximum": 75.544,
+      "mean": 71.80166666666666,
+      "median": 73.803,
+      "minimum": 66.058
+    },
+    "variation_percent_from_phase0": {
+      "readiness_mean": 12.660108054958444,
+      "wall_duration_mean": 13.674579624134534
+    }
+  },
+  "status": "passed",
+  "suitable_as_final_boot_regression_baseline": true
+}
