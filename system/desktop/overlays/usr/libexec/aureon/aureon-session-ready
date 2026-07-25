@@ -15,6 +15,7 @@ kscreen_before="${state_dir}/kscreen-before.json"
 kscreen_after="${state_dir}/kscreen-after.json"
 kscreen_error="${state_dir}/kscreen-error.txt"
 display_observation="${state_dir}/display-observation.json"
+probe_lock="${state_dir}/session-probe.lock"
 probe_state="running"
 session_state="waiting-for-plasma"
 kwin_state="not-observed"
@@ -24,6 +25,10 @@ appearance_state="not-applied"
 failure_reason="none"
 umask 077
 install -d -m 0700 "$state_dir"
+if ! mkdir "$probe_lock" 2>/dev/null; then
+    exit 0
+fi
+trap 'rmdir "$probe_lock" 2>/dev/null || true' EXIT HUP INT TERM
 rm -f "$ready_file" "$state_file" "$kscreen_before" "$kscreen_after" \
     "$kscreen_error" "$display_observation" \
     "${state_dir}/baseline.json" "${state_dir}/core.json" "${state_dir}/services.json"
@@ -106,6 +111,10 @@ else
     fail_probe "appearance-application-failed"
 fi
 write_state
+
+if ! /usr/libexec/aureon/aureon-plasma-layout-ready; then
+    fail_probe "plasma-panel-layout-invalid"
+fi
 
 if ! command -v kscreen-doctor >/dev/null 2>&1; then
     fail_probe "kscreen-doctor-missing"

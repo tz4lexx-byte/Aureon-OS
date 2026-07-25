@@ -27,7 +27,10 @@ while [ "$attempt" -lt 20 ]; do
     sleep 1
 done
 
-plasma-apply-lookandfeel --apply org.aureon.desktop
+# Applying colors alone does not install the look-and-feel package's desktop
+# layout.  This marker is profile-local, so reset the layout exactly once for a
+# new Aureon profile and leave all later user customization untouched.
+plasma-apply-lookandfeel --apply org.aureon.desktop --resetLayout
 
 applied=false
 if command -v plasma-apply-wallpaperimage >/dev/null 2>&1; then

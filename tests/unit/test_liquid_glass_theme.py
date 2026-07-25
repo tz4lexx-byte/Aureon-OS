@@ -109,6 +109,7 @@ class LiquidGlassThemeTests(unittest.TestCase):
 
         self.assertIn("aureon-apply-appearance", readiness.read_text(encoding="utf-8"))
         self.assertIn("plasma-apply-wallpaperimage", helper_source)
+        self.assertIn("plasma-apply-lookandfeel --apply org.aureon.desktop --resetlayout", helper_source)
         self.assertIn("liquid-glass-v1-applied", helper_source)
         for forbidden in ("curl", "wget", "sudo", "physicaldrive", "/mnt/c", "rm -rf"):
             self.assertNotIn(forbidden, helper_source)

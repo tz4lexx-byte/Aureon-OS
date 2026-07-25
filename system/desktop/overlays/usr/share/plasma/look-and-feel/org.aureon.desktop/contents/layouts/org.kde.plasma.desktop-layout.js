@@ -12,6 +12,13 @@ panel.addWidget("org.kde.plasma.pager");
 panel.addWidget("org.kde.plasma.icontasks");
 panel.addWidget("org.kde.plasma.marginsseparator");
 panel.addWidget("org.kde.plasma.systemtray");
-panel.addWidget("org.aureon.systemoverview");
+
+// An optional Aureon widget must never prevent Plasma from retaining the
+// panel and its essential controls if the package cannot be instantiated.
+try {
+    panel.addWidget("org.aureon.systemoverview");
+} catch (error) {
+    // Keep constructing the core panel even when the optional applet fails.
+}
 panel.addWidget("org.kde.plasma.digitalclock");
 panel.addWidget("org.kde.plasma.showdesktop");

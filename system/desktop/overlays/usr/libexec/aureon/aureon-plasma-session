@@ -27,6 +27,11 @@ umask 077
 install -d -m 0700 "$state_dir"
 printf 'launcher_state=starting-plasma\n' > "${state_dir}/launcher-state"
 
+# XDG autostart is deliberately retained as a fallback, but the preview's
+# readiness contract cannot depend on Plasma discovering it.  The probe has an
+# atomic single-instance guard, so starting it here is deterministic.
+/usr/libexec/aureon/aureon-session-ready &
+
 set +e
 /usr/bin/startplasma-wayland
 status=$?

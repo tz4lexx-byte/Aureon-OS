@@ -20,6 +20,7 @@ SYSTEM_PROBE = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-wait-desktop-rea
 READY_SERVICE = OVERLAY / "usr" / "lib" / "systemd" / "system" / "aureon-desktop-ready.service"
 PLASMA_LAUNCHER = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-plasma-session"
 DISPLAY_PROBE = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-display"
+LAYOUT_PROBE = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-plasma-layout-ready"
 READINESS_AUTOSTART = OVERLAY / "etc" / "xdg" / "autostart" / "aureon-session-ready.desktop"
 
 
@@ -55,6 +56,14 @@ class DesktopReadinessTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
 
+    def test_launcher_starts_readiness_independently_of_xdg_autostart(self):
+        launcher = PLASMA_LAUNCHER.read_text(encoding="utf-8")
+        probe_start = launcher.index("/usr/libexec/aureon/aureon-session-ready &")
+        plasma_start = launcher.index("/usr/bin/startplasma-wayland")
+
+        self.assertLess(probe_start, plasma_start)
+        self.assertIn("session-probe.lock", SESSION_PROBE.read_text(encoding="utf-8"))
+
     def test_ready_marker_requires_responsive_kwin_and_plasma(self):
         session = SESSION_PROBE.read_text(encoding="utf-8")
         bridge = SYSTEM_PROBE.read_text(encoding="utf-8")
@@ -64,6 +73,8 @@ class DesktopReadinessTests(unittest.TestCase):
         self.assertIn("kwin_wayland", session)
         self.assertIn("plasmashell", session)
         self.assertIn("org.freedesktop.DBus.Peer.Ping", session)
+        self.assertIn("aureon-plasma-layout-ready", session)
+        self.assertTrue(LAYOUT_PROBE.is_file())
         self.assertNotIn("AUREON_DESKTOP_READY", session)
         self.assertIn("session-ready", bridge)
         self.assertIn("AUREON_EVIDENCE", bridge)

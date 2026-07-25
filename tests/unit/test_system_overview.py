@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ LAYOUT = (
     / "layouts"
     / "org.kde.plasma.desktop-layout.js"
 )
+LAYOUT_PROBE = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-plasma-layout-ready"
 
 
 def load_control_module():
@@ -43,10 +45,23 @@ def load_control_module():
     return module
 
 
+def load_layout_probe():
+    name = "aureon_plasma_layout_probe_under_test"
+    loader = importlib.machinery.SourceFileLoader(name, str(LAYOUT_PROBE))
+    spec = importlib.util.spec_from_loader(name, loader)
+    if spec is None:
+        raise RuntimeError("Unable to load Plasma layout probe")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
 class AureonSystemOverviewTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.control = load_control_module()
+        cls.layout_probe = load_layout_probe()
 
     def report(self, files=None, *, cpu=8, storage=None, kernel="6.12.0", architecture="x86_64"):
         fixtures = files or {
@@ -172,6 +187,70 @@ class AureonSystemOverviewTests(unittest.TestCase):
         self.assertIn("JSON.parse", qml)
         self.assertIn("Accessible.name", qml)
         self.assertIn("ScrollView", qml)
+
+    def test_plasma_6_layout_explicitly_creates_the_complete_bottom_panel(self):
+        layout = LAYOUT.read_text(encoding="utf-8")
+        plugins = (
+            "org.kde.plasma.kickoff",
+            "org.kde.plasma.icontasks",
+            "org.kde.plasma.systemtray",
+            "org.aureon.systemoverview",
+            "org.kde.plasma.digitalclock",
+        )
+        self.assertIn("new Panel", layout)
+        self.assertIn('panel.location = "bottom"', layout)
+        for plugin in plugins:
+            self.assertEqual(layout.count(f'panel.addWidget("{plugin}")'), 1)
+        self.assertLess(layout.index("org.kde.plasma.systemtray"), layout.index("org.aureon.systemoverview"))
+        self.assertLess(layout.index("org.aureon.systemoverview"), layout.index("org.kde.plasma.digitalclock"))
+
+    def test_widget_failure_is_isolated_after_panel_creation(self):
+        layout = LAYOUT.read_text(encoding="utf-8")
+        overview = layout.index('panel.addWidget("org.aureon.systemoverview")')
+        self.assertLess(layout.index("new Panel"), overview)
+        self.assertLess(layout.index("try {"), overview)
+        self.assertLess(overview, layout.index("catch (error)"))
+        self.assertLess(layout.index("catch (error)"), layout.index("org.kde.plasma.digitalclock"))
+
+    def test_persisted_profile_requires_one_complete_bottom_panel(self):
+        appletsrc = """\
+[Containments][1]
+plugin=org.kde.plasma.folder
+[Containments][2]
+plugin=org.kde.panel
+location=4
+[Containments][2][Applets][10]
+plugin=org.kde.plasma.kickoff
+[Containments][2][Applets][11]
+plugin=org.kde.plasma.icontasks
+[Containments][2][Applets][12]
+plugin=org.kde.plasma.systemtray
+[Containments][2][Applets][13]
+plugin=org.aureon.systemoverview
+[Containments][2][Applets][14]
+plugin=org.kde.plasma.digitalclock
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plasma-org.kde.plasma.desktop-appletsrc"
+            path.write_text(appletsrc, encoding="utf-8")
+            first = self.layout_probe.inspect(path)
+            second = self.layout_probe.inspect(path)
+        self.assertEqual(first, second)
+        self.assertEqual(first["state"], "valid")
+        self.assertEqual(first["panel_count"], 1)
+        self.assertEqual(first["valid_panel_count"], 1)
+
+    def test_wallpaper_only_or_incomplete_panel_is_not_ready(self):
+        fixtures = (
+            "[Containments][1]\nplugin=org.kde.plasma.folder\n",
+            "[Containments][2]\nplugin=org.kde.panel\nlocation=3\n",
+            "[Containments][2]\nplugin=org.kde.panel\nlocation=4\n",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plasma-org.kde.plasma.desktop-appletsrc"
+            for fixture in fixtures:
+                path.write_text(fixture, encoding="utf-8")
+                self.assertEqual(self.layout_probe.inspect(path)["state"], "invalid")
 
 
 if __name__ == "__main__":

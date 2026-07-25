@@ -1,0 +1,92 @@
+#!/usr/bin/python3
+"""Validate the persisted Plasma 6 panel contract without loading any widget."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+
+REQUIRED_PLUGINS = (
+    "org.kde.plasma.kickoff",
+    "org.kde.plasma.icontasks",
+    "org.kde.plasma.systemtray",
+    "org.kde.plasma.digitalclock",
+    "org.aureon.systemoverview",
+)
+GROUP = re.compile(r"^\[Containments\]\[(\d+)\](?:\[Applets\]\[(\d+)\])?$")
+
+
+def inspect(path: Path) -> dict[str, object]:
+    containments: dict[str, dict[str, object]] = {}
+    containment_id: str | None = None
+    applet_id: str | None = None
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        match = GROUP.fullmatch(line)
+        if match:
+            containment_id, applet_id = match.groups()
+            containment = containments.setdefault(
+                containment_id, {"settings": {}, "applets": {}}
+            )
+            if applet_id is not None:
+                containment["applets"].setdefault(applet_id, {})
+            continue
+        if not line or line.startswith(("#", "[")) or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if containment_id is None:
+            continue
+        target = containments[containment_id]["settings"]
+        if applet_id is not None:
+            target = containments[containment_id]["applets"][applet_id]
+        target[key.strip()] = value.strip()
+
+    candidates = []
+    for candidate_id, containment in containments.items():
+        settings = containment["settings"]
+        plugins = tuple(
+            applet.get("plugin", "")
+            for applet in containment["applets"].values()
+        )
+        if settings.get("plugin") == "org.kde.panel":
+            candidates.append(
+                {
+                    "id": candidate_id,
+                    "location": settings.get("location"),
+                    "plugins": plugins,
+                }
+            )
+
+    valid = [
+        panel
+        for panel in candidates
+        if panel["location"] == "4"
+        and all(plugin in panel["plugins"] for plugin in REQUIRED_PLUGINS)
+    ]
+    return {
+        "state": "valid" if valid else "invalid",
+        "panel_count": len(candidates),
+        "valid_panel_count": len(valid),
+        "required_plugins": REQUIRED_PLUGINS,
+    }
+
+
+def main(argv: list[str]) -> int:
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    path = Path(argv[0]) if argv else config_home / "plasma-org.kde.plasma.desktop-appletsrc"
+    result = inspect(path)
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["state"] == "valid" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
