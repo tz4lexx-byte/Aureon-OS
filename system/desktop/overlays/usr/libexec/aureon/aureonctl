@@ -221,6 +221,90 @@ def _safe_read(path: Path, limit: int = 131_072) -> str | None:
         return None
 
 
+def _human_bytes(value: int | None) -> str:
+    if value is None or value < 0:
+        return "Unavailable"
+    unit = "GiB" if value >= 1024**3 else "MiB"
+    divisor = 1024**3 if unit == "GiB" else 1024**2
+    return "{0:.1f} {1}".format(value / divisor, unit)
+
+
+def _human_uptime(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "Unavailable"
+    minutes = int(seconds) // 60
+    hours, minutes = divmod(minutes, 60)
+    return "{0}h {1}m".format(hours, minutes) if hours else "{0}m".format(minutes)
+
+
+def _os_version(release: str | None) -> str:
+    if not release:
+        return "Unavailable"
+    values: dict[str, str] = {}
+    for line in release.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in {"VERSION", "VERSION_ID"}:
+            values[key] = value.strip().strip("\"'")
+    return values.get("VERSION") or values.get("VERSION_ID") or "Unavailable"
+
+
+def _overview_report() -> dict[str, Any]:
+    """Return a bounded, non-identifying summary from fixed local sources."""
+
+    unavailable = "Unavailable"
+    mem_total: int | None = None
+    memory = _safe_read(Path("/proc/meminfo"), 16_384)
+    if memory:
+        match = re.search(r"^MemTotal:\s+(\d+)\s+kB$", memory, re.MULTILINE)
+        if match:
+            mem_total = int(match.group(1)) * 1024
+
+    uptime: float | None = None
+    uptime_text = _safe_read(Path("/proc/uptime"), 256)
+    if uptime_text:
+        try:
+            uptime = float(uptime_text.split()[0])
+        except (IndexError, ValueError):
+            pass
+
+    storage_total: int | None = None
+    storage_available: int | None = None
+    try:
+        storage = os.statvfs("/")
+        storage_total = storage.f_frsize * storage.f_blocks
+        storage_available = storage.f_frsize * storage.f_bavail
+    except OSError:
+        pass
+
+    cpu_count = os.cpu_count()
+    values = {
+        "system_name": "Aureon OS",
+        "system_version": _os_version(_safe_read(Path("/etc/os-release"), 16_384)),
+        "kernel_version": platform.release() or unavailable,
+        "architecture": platform.machine() or unavailable,
+        "logical_cpus": str(cpu_count) if cpu_count is not None and cpu_count > 0 else unavailable,
+        "memory_total": _human_bytes(mem_total),
+        "storage_total": _human_bytes(storage_total),
+        "storage_available": _human_bytes(storage_available),
+        "uptime": _human_uptime(uptime),
+    }
+    available = sum(value != unavailable for value in values.values())
+    if available == len(values):
+        state = "Healthy"
+    elif available > 1:
+        state = "Limited data"
+    else:
+        state = unavailable
+    return {
+        "state": state,
+        "values": values,
+        "privacy": "local-only, read-only, non-identifying",
+        "writes_performed": False,
+    }
+
+
 def _safe_command(argv: tuple[str, ...], timeout: int = 8) -> dict[str, Any]:
     """Capture a fixed local inspection command without a shell or network."""
 
@@ -825,6 +909,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("validate", help="validate local source contracts without writing")
     commands.add_parser("reproducibility", help="inspect local reproducibility controls and remaining gates")
     commands.add_parser("baseline", help="collect a local baseline without storing or exporting it")
+    commands.add_parser("overview", help="show a non-identifying local system overview")
 
     core = commands.add_parser("core", help="verify the minimal Aureon desktop package surface")
     core_sub = core.add_subparsers(dest="core_command", required=True)
@@ -889,6 +974,8 @@ def main(arguments: list[str] | None = None, output: TextIO | None = None) -> in
             _emit({"command": "reproducibility", "result": _reproducibility_report()}, output)
         elif args.command == "baseline":
             _emit({"command": "baseline", "result": _baseline_report(), "data_sent": False}, output)
+        elif args.command == "overview":
+            _emit({"command": "overview", "result": _overview_report(), "data_sent": False}, output)
         elif args.command == "core":
             _emit({"command": "core doctor", "result": _core_report()}, output)
         elif args.command == "services":
