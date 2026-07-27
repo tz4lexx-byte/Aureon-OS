@@ -61,6 +61,9 @@ write_state() {
         printf 'display_requested=1920x1080@60\n'
         printf 'display_state=%s\n' "$display_state"
         printf 'failure_reason=%s\n' "$failure_reason"
+        if [ -s "$panel_observation" ]; then
+            sed 's/^/panel_observation=/' "$panel_observation"
+        fi
         if [ -r "$display_observation" ]; then
             sed 's/^/display_observation=/' "$display_observation"
         fi

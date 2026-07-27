@@ -31,6 +31,21 @@ LAYOUT = (
     / "org.kde.plasma.desktop-layout.js"
 )
 LAYOUT_PROBE = OVERLAY / "usr" / "libexec" / "aureon" / "aureon-plasma-layout-ready"
+VALID_APPLETSRC = """\
+[Containments][2]
+plugin=org.kde.panel
+location=4
+[Containments][2][Applets][10]
+plugin=org.kde.plasma.kickoff
+[Containments][2][Applets][11]
+plugin=org.kde.plasma.icontasks
+[Containments][2][Applets][12]
+plugin=org.kde.plasma.systemtray
+[Containments][2][Applets][13]
+plugin=org.aureon.systemoverview
+[Containments][2][Applets][14]
+plugin=org.kde.plasma.digitalclock
+"""
 
 
 def load_control_module():
@@ -213,26 +228,9 @@ class AureonSystemOverviewTests(unittest.TestCase):
         self.assertLess(layout.index("catch (error)"), layout.index("org.kde.plasma.digitalclock"))
 
     def test_persisted_profile_requires_one_complete_bottom_panel(self):
-        appletsrc = """\
-[Containments][1]
-plugin=org.kde.plasma.folder
-[Containments][2]
-plugin=org.kde.panel
-location=4
-[Containments][2][Applets][10]
-plugin=org.kde.plasma.kickoff
-[Containments][2][Applets][11]
-plugin=org.kde.plasma.icontasks
-[Containments][2][Applets][12]
-plugin=org.kde.plasma.systemtray
-[Containments][2][Applets][13]
-plugin=org.aureon.systemoverview
-[Containments][2][Applets][14]
-plugin=org.kde.plasma.digitalclock
-"""
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "plasma-org.kde.plasma.desktop-appletsrc"
-            path.write_text(appletsrc, encoding="utf-8")
+            path.write_text(VALID_APPLETSRC, encoding="utf-8")
             first = self.layout_probe.inspect(path)
             second = self.layout_probe.inspect(path)
         self.assertEqual(first, second)
@@ -251,6 +249,94 @@ plugin=org.kde.plasma.digitalclock
             for fixture in fixtures:
                 path.write_text(fixture, encoding="utf-8")
                 self.assertEqual(self.layout_probe.inspect(path)["state"], "invalid")
+
+    def _wait_through(self, fixtures, *, timeout=1.0, interval=0.25):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plasma-org.kde.plasma.desktop-appletsrc"
+            elapsed = 0.0
+            index = 0
+
+            def apply_fixture():
+                fixture = fixtures[index]
+                if fixture is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(fixture if isinstance(fixture, bytes) else fixture.encode())
+
+            def clock():
+                return elapsed
+
+            def sleeper(duration):
+                nonlocal elapsed, index
+                elapsed += duration
+                if index + 1 < len(fixtures):
+                    index += 1
+                    apply_fixture()
+
+            apply_fixture()
+            result = self.layout_probe.wait_for_layout(
+                path,
+                timeout_seconds=timeout,
+                retry_interval_seconds=interval,
+                clock=clock,
+                sleeper=sleeper,
+            )
+            return result, elapsed
+
+    def test_missing_appletsrc_then_valid_becomes_ready(self):
+        result, _ = self._wait_through((None, VALID_APPLETSRC, VALID_APPLETSRC))
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["attempts"], 3)
+
+    def test_partial_file_then_valid_becomes_ready(self):
+        result, _ = self._wait_through(
+            (b"[Containments][2", VALID_APPLETSRC, VALID_APPLETSRC)
+        )
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["observation"]["reason"], "layout-valid")
+
+    def test_incomplete_panel_then_complete_becomes_ready(self):
+        incomplete = "[Containments][2]\nplugin=org.kde.panel\nlocation=4\n"
+        result, _ = self._wait_through(
+            (incomplete, VALID_APPLETSRC, VALID_APPLETSRC)
+        )
+        self.assertEqual(result["state"], "ready")
+        self.assertGreaterEqual(result["changes_observed"], 1)
+
+    def test_valid_layout_requires_two_stable_observations(self):
+        result, _ = self._wait_through((VALID_APPLETSRC, VALID_APPLETSRC))
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["stable_samples"], 2)
+        self.assertEqual(result["attempts"], 2)
+
+    def test_permanently_invalid_layout_fails_only_at_deadline(self):
+        incomplete = "[Containments][2]\nplugin=org.kde.panel\nlocation=4\n"
+        result, elapsed = self._wait_through(
+            (incomplete,), timeout=0.5, interval=0.25
+        )
+        self.assertEqual(result["state"], "invalid")
+        self.assertEqual(result["reason"], "plasma-panel-layout-invalid")
+        self.assertEqual(result["observation"]["reason"], "panel-incomplete-or-invalid")
+        self.assertEqual(result["attempts"], 3)
+        self.assertEqual(elapsed, 0.5)
+
+    def test_first_invalid_observation_is_not_terminal(self):
+        result, _ = self._wait_through((None, None, VALID_APPLETSRC, VALID_APPLETSRC))
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["attempts"], 4)
+
+    def test_retry_deadline_is_not_extended(self):
+        result, elapsed = self._wait_through((None,), timeout=0.6, interval=0.25)
+        self.assertEqual(result["state"], "invalid")
+        self.assertEqual(elapsed, 0.6)
+
+    def test_retry_result_is_deterministic_and_preserves_last_observation(self):
+        fixtures = (b"\xff", "[Containments][2]\nplugin=org.kde.panel\n")
+        first, _ = self._wait_through(fixtures, timeout=0.5, interval=0.25)
+        second, _ = self._wait_through(fixtures, timeout=0.5, interval=0.25)
+        self.assertEqual(first, second)
+        self.assertEqual(first["reason"], "plasma-panel-layout-invalid")
+        self.assertEqual(first["observation"]["reason"], "panel-incomplete-or-invalid")
 
 
 if __name__ == "__main__":
