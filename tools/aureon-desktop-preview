@@ -4,13 +4,13 @@
 This developer tool is deliberately separate from ``aureon-dev test-smoke``.
 It creates a new bootable *virtual* disk and a new copy-on-write QEMU overlay,
 then opens that overlay in a GTK window through WSLg.  It never accepts a host
-disk, shares a host directory with the guest, creates a guest NIC, installs
+disk, shares a host directory with the guest, publishes an inbound guest port, installs
 anything into Windows, or changes the Windows boot configuration.
 
 The first build downloads the explicitly listed Fedora desktop packages into
 the dedicated WSL Podman store.  That is why execution requires both
-``--execute`` and ``--allow-build-network``.  Conversion and the guest itself
-run with networking disabled.
+``--execute`` and ``--allow-build-network``. Conversion remains offline; the
+gaming guest uses QEMU user-mode NAT without inbound port forwarding.
 """
 
 from __future__ import annotations
@@ -329,7 +329,7 @@ def create_plan(
         "execution": {
             "mode": "dry-run",
             "allow_build_network_required": True,
-            "guest_network": "disabled",
+            "guest_network": "qemu-user-nat-no-inbound-forwarding",
             "boot_timeout_seconds": boot_timeout,
             "acceleration_policy": acceleration,
             "memory_mib": DEFAULT_MEMORY_MIB,
@@ -1129,9 +1129,9 @@ def qemu_command(
         "-device",
         "usb-tablet,bus=xhci.0",
         "-display",
-        "gtk,gl=off,zoom-to-fit=off,show-tabs=off",
+        "gtk,gl=off,zoom-to-fit=on,full-screen=on,show-tabs=off",
         "-nic",
-        "none",
+        "user,model=virtio-net-pci",
         "-serial",
         "file:{0}".format(paths.serial_log),
         "-qmp",
@@ -1247,8 +1247,32 @@ def _extract_guest_evidence(serial_log: Path) -> dict[str, dict]:
     except OSError as error:
         raise PreviewError("desktop serial evidence is unreadable: {0}".format(error)) from error
     reports: dict[str, dict] = {}
-    pattern = re.compile(r"AUREON_EVIDENCE (baseline|core|services)=([A-Za-z0-9+/=]{4,262144})")
-    for name, encoded in pattern.findall(serial):
+    encoded_reports: dict[str, str] = {}
+    legacy = re.compile(r"AUREON_EVIDENCE (baseline|core|services)=([A-Za-z0-9+/=]{4,262144})")
+    encoded_reports.update(legacy.findall(serial))
+
+    chunk_pattern = re.compile(
+        r"^[^\r\n]*?AUREON_EVIDENCE_CHUNK name=(baseline|core|services) "
+        r"index=(\d{4}) total=(\d{4}) data=([A-Za-z0-9+/=]{1,512})\r?$",
+        re.MULTILINE,
+    )
+    chunked: dict[str, dict[int, str]] = {}
+    totals: dict[str, int] = {}
+    for name, index_text, total_text, data in chunk_pattern.findall(serial):
+        index = int(index_text)
+        total = int(total_text)
+        if not 1 <= index <= total <= 512:
+            continue
+        if name in totals and totals[name] != total:
+            continue
+        totals[name] = total
+        chunked.setdefault(name, {}).setdefault(index, data)
+    for name, chunks in chunked.items():
+        total = totals[name]
+        if all(index in chunks for index in range(1, total + 1)):
+            encoded_reports[name] = "".join(chunks[index] for index in range(1, total + 1))
+
+    for name, encoded in encoded_reports.items():
         try:
             decoded = base64.b64decode(encoded, validate=True)
             parsed = json.loads(decoded.decode("utf-8"))
@@ -1837,7 +1861,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-build-network",
         action="store_true",
-        help="acknowledge the one package-fetch stage; conversion and guest networking remain disabled",
+        help="acknowledge package fetching; conversion stays offline and the gaming guest uses user-mode NAT",
     )
     parser.add_argument(
         "--boot-timeout-seconds",

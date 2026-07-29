@@ -30,6 +30,18 @@ mínima de Fase 0 no cambia ni se instala en Windows. La primera creación de la
 preview descarga los paquetes Fedora explícitamente listados dentro de Ubuntu
 WSL; su VM no tiene red, carpetas compartidas ni discos físicos.
 
+La edición de escritorio incorpora Discover, Flatpak, Wi-Fi, Bluetooth,
+Firefox, LibreOffice, codecs libres y la pila Mesa/Vulkan. Steam y OBS Studio
+se incluyen como Flatpaks; Heroic y Kdenlive permanecen opcionales según
+[la guía de aplicaciones](docs/user/getting-apps.md), sin mezclarlos con el
+núcleo inmutable.
+
+El perfil de laptop añade energía, brillo, cámara, touchpad, GPU híbrida y el
+diagnóstico local `aureon-laptop-check`. El flujo `aureon-build-usb` prepara un
+ISO UEFI con prueba Live, instalación interactiva y modo de gráficos básicos;
+consulta [la guía de Live USB](docs/testing/laptop-live-usb.md) y el
+[contrato de seguridad](docs/installer/safety-contract.md).
+
 ## Fundamentos de las fases maestras
 
 El control local `aureonctl` materializa los contratos de las fases 0–32 sin

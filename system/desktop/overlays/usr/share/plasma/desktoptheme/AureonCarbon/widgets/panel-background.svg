@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180" viewBox="0 0 180 180">
+  <defs>
+    <linearGradient id="carbon" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#25282d" stop-opacity="0.98"/>
+      <stop offset="1" stop-color="#101215" stop-opacity="0.98"/>
+    </linearGradient>
+  </defs>
+  <g id="hint-stretch-borders" opacity="0"><rect x="28" y="28" width="124" height="124"/></g>
+  <g id="topleft"><rect x="6" y="6" width="22" height="22" rx="6" fill="url(#carbon)"/></g>
+  <g id="top"><rect x="28" y="6" width="124" height="22" fill="url(#carbon)" stroke="#454a52" stroke-width="1"/></g>
+  <g id="topright"><rect x="152" y="6" width="22" height="22" rx="6" fill="url(#carbon)"/></g>
+  <g id="left"><rect x="6" y="28" width="22" height="124" fill="url(#carbon)"/></g>
+  <g id="center"><rect x="28" y="28" width="124" height="124" fill="url(#carbon)"/></g>
+  <g id="right"><rect x="152" y="28" width="22" height="124" fill="url(#carbon)"/></g>
+  <g id="bottomleft"><rect x="6" y="152" width="22" height="22" rx="6" fill="url(#carbon)"/></g>
+  <g id="bottom"><rect x="28" y="152" width="124" height="22" fill="url(#carbon)"/></g>
+  <g id="bottomright"><rect x="152" y="152" width="22" height="22" rx="6" fill="url(#carbon)"/></g>
+</svg>

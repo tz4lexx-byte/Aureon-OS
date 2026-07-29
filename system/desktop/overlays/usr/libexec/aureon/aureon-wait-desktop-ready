@@ -2,7 +2,7 @@
 # System-side bridge from the Plasma session probe to serial evidence.
 set -u
 
-state_dir="/run/user/1000/aureon"
+state_dir="${AUREON_DESKTOP_STATE_DIR:-/run/aureon-desktop-ready}"
 state_file="${state_dir}/session-state"
 ready_file="${state_dir}/session-ready"
 attempt=0
@@ -32,6 +32,15 @@ emit_diagnostics() {
     printf 'AUREON_DESKTOP_DIAGNOSTICS_END\n' >&2
 }
 
+if [ ! -d "$state_dir" ]; then
+    printf 'AUREON_DESKTOP_NOT_READY reason=state-directory-missing path=%s\n' "$state_dir" >&2
+    exit 1
+fi
+if [ ! -r "$state_dir" ] || [ ! -x "$state_dir" ]; then
+    printf 'AUREON_DESKTOP_NOT_READY reason=state-directory-unreadable path=%s\n' "$state_dir" >&2
+    exit 1
+fi
+
 while [ "$attempt" -lt 240 ]; do
     if [ -f "$ready_file" ] && [ -r "$state_file" ]; then
         cat "$state_file"
@@ -42,8 +51,24 @@ while [ "$attempt" -lt 240 ]; do
                 emit_diagnostics
                 exit 1
             fi
+            # Serial output from the kernel and systemd can interleave with a
+            # long write. Emit bounded, numbered chunks three times so the
+            # host can reconstruct a complete report even if one copy of a
+            # chunk is interrupted by an audit message.
             encoded="$(base64 -w 0 < "$report_file")"
-            printf 'AUREON_EVIDENCE %s=%s\n' "$report" "$encoded"
+            chunks=$(((${#encoded} + 511) / 512))
+            index=1
+            while [ "$index" -le "$chunks" ]; do
+                offset=$(((index - 1) * 512))
+                chunk="$(printf '%s' "$encoded" | cut -c "$((offset + 1))-$((offset + 512))")"
+                repeat=1
+                while [ "$repeat" -le 3 ]; do
+                    printf 'AUREON_EVIDENCE_CHUNK name=%s index=%04d total=%04d data=%s\n' \
+                        "$report" "$index" "$chunks" "$chunk"
+                    repeat=$((repeat + 1))
+                done
+                index=$((index + 1))
+            done
         done
         printf 'AUREON_DESKTOP_READY\n'
         exit 0
@@ -58,5 +83,9 @@ while [ "$attempt" -lt 240 ]; do
 done
 
 emit_diagnostics
-printf 'AUREON_DESKTOP_NOT_READY\n' >&2
+if [ ! -r "$state_file" ]; then
+    printf 'AUREON_DESKTOP_NOT_READY reason=probe-state-missing\n' >&2
+else
+    printf 'AUREON_DESKTOP_NOT_READY reason=probe-timeout\n' >&2
+fi
 exit 1

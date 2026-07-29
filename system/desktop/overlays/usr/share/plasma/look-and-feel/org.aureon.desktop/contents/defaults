@@ -3,13 +3,13 @@ widgetStyle=Breeze
 LookAndFeelPackage=org.aureon.desktop
 
 [kdeglobals][General]
-ColorScheme=AureonLiquidGlass
+ColorScheme=AureonCarbon
 
 [kdeglobals][Icons]
 Theme=breeze
 
 [plasmarc][Theme]
-name=AureonLiquidGlass
+name=AureonCarbon
 
 [Wallpaper]
 Image=Next

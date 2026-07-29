@@ -1,0 +1,72 @@
+name: Publish Aureon update
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Update channel to publish
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - testing
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: aureon-update-${{ inputs.channel }}
+  cancel-in-progress: false
+
+jobs:
+  validate-and-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out reviewed source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate Aureon contracts
+        run: |
+          python3 -m unittest discover -s tests/unit -p 'test_*.py'
+          python3 tools/aureonctl validate
+
+      - name: Install OCI build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes buildah
+
+      - name: Build immutable Aureon desktop image
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/aureon-os:${{ inputs.channel }}
+        run: |
+          buildah bud \
+            --format oci \
+            --tag "${IMAGE}" \
+            --file system/desktop/Containerfile \
+            system/desktop
+
+      - name: Authenticate to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "${GHCR_TOKEN}" |
+            buildah login ghcr.io \
+              --username "${{ github.actor }}" \
+              --password-stdin
+
+      - name: Publish selected channel
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/aureon-os:${{ inputs.channel }}
+        run: |
+          buildah push --digestfile aureon-update.digest "${IMAGE}"
+          test -s aureon-update.digest
+          {
+            echo "### Aureon update published"
+            echo
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Digest: \`$(cat aureon-update.digest)\`"
+            echo "- Reboot policy: user controlled"
+          } >> "${GITHUB_STEP_SUMMARY}"

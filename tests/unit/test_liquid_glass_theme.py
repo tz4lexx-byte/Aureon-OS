@@ -42,11 +42,15 @@ class LiquidGlassThemeTests(unittest.TestCase):
         status = self.control.main(arguments, output=output)
         return status, json.loads(output.getvalue())
 
-    def test_profile_catalog_is_complete_and_balanced_is_default(self):
+    def test_profile_catalog_offers_carbon_by_default_and_liquid_glass(self):
         catalog = json.loads((ROOT / "packaging" / "appearance-profiles.json").read_text(encoding="utf-8"))
         authority = json.loads((ROOT / "packaging" / "aureon-control-plane.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(catalog["default_profile"], "balanced")
+        self.assertEqual(catalog["default_style"], "carbon")
+        self.assertEqual(set(catalog["styles"]), {"carbon", "liquid-glass"})
+        self.assertEqual(catalog["styles"]["carbon"]["color_scheme"], "AureonCarbon")
+        self.assertEqual(catalog["styles"]["liquid-glass"]["color_scheme"], "AureonLiquidGlass")
+        self.assertEqual(catalog["default_profile"], "off")
         self.assertEqual(set(catalog["profiles"]), {"off", "lite", "balanced", "ultra"})
         self.assertEqual(authority["actions"]["desktop.apply-appearance"]["authority"], "A")
         self.assertTrue(authority["actions"]["desktop.apply-appearance"]["reversible"])
@@ -61,7 +65,7 @@ class LiquidGlassThemeTests(unittest.TestCase):
         self.assertIn("download assets", result["does_not"])
         self.assertIn("override a user choice after initial setup", result["does_not"])
 
-    def test_color_scheme_and_default_configs_select_liquid_glass(self):
+    def test_color_schemes_are_installed_and_default_configs_select_carbon(self):
         colors = OVERLAY / "usr" / "share" / "color-schemes" / "AureonLiquidGlass.colors"
         parser = configparser.ConfigParser(interpolation=None)
         parser.optionxform = str
@@ -71,8 +75,14 @@ class LiquidGlassThemeTests(unittest.TestCase):
         self.assertIn("Colors:Window", parser)
         self.assertIn("Colors:Selection", parser)
         self.assertEqual(parser["Colors:Window"]["BackgroundNormal"], "22,32,57")
-        self.assertIn("ColorScheme=AureonLiquidGlass", (OVERLAY / "etc" / "skel" / ".config" / "kdeglobals").read_text(encoding="utf-8"))
-        self.assertIn("name=AureonLiquidGlass", (OVERLAY / "etc" / "skel" / ".config" / "plasmarc").read_text(encoding="utf-8"))
+        carbon = configparser.ConfigParser(interpolation=None)
+        carbon.optionxform = str
+        carbon.read_string(
+            (OVERLAY / "usr" / "share" / "color-schemes" / "AureonCarbon.colors").read_text(encoding="utf-8")
+        )
+        self.assertEqual(carbon["General"]["Name"], "Aureon Carbon")
+        self.assertIn("ColorScheme=AureonCarbon", (OVERLAY / "etc" / "skel" / ".config" / "kdeglobals").read_text(encoding="utf-8"))
+        self.assertIn("name=AureonCarbon", (OVERLAY / "etc" / "skel" / ".config" / "plasmarc").read_text(encoding="utf-8"))
 
     def test_theme_metadata_and_vector_assets_are_local_and_valid_xml(self):
         metadata = json.loads((self.theme_root / "metadata.json").read_text(encoding="utf-8"))
@@ -97,7 +107,9 @@ class LiquidGlassThemeTests(unittest.TestCase):
         kwin = (OVERLAY / "etc" / "skel" / ".config" / "kwinrc").read_text(encoding="utf-8")
 
         self.assertIn('panel.opacity = "translucent"', layout)
-        self.assertIn("panel.floating = true", layout)
+        self.assertIn('panel.lengthMode = "fill"', layout)
+        self.assertIn('panel.hiding = "none"', layout)
+        self.assertIn("panel.floating = false", layout)
         self.assertIn("blurEnabled=true", kwin)
         self.assertIn("contrastEnabled=true", kwin)
         self.assertIn("BlurStrength=6", kwin)
@@ -109,7 +121,11 @@ class LiquidGlassThemeTests(unittest.TestCase):
 
         self.assertIn("aureon-apply-appearance", readiness.read_text(encoding="utf-8"))
         self.assertIn("plasma-apply-wallpaperimage", helper_source)
-        self.assertIn("liquid-glass-v1-applied", helper_source)
+        self.assertIn("plasma-apply-lookandfeel --apply org.aureon.desktop --resetlayout", helper_source)
+        self.assertIn("carbon-v2-sharp-wallpaper-applied", helper_source)
+        self.assertIn("/usr/share/wallpapers/aureoncarbon/", helper_source)
+        self.assertIn('writeconfig("fillmode",2)', helper_source)
+        self.assertIn('writeconfig("blur",false)', helper_source)
         for forbidden in ("curl", "wget", "sudo", "physicaldrive", "/mnt/c", "rm -rf"):
             self.assertNotIn(forbidden, helper_source)
 

@@ -1,0 +1,222 @@
+#!/usr/bin/python3
+"""Validate the persisted Plasma 6 panel contract without loading any widget."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Callable
+
+
+REQUIRED_PLUGINS = (
+    "org.kde.plasma.kickoff",
+    "org.kde.plasma.icontasks",
+    "org.kde.plasma.systemtray",
+    "org.kde.plasma.digitalclock",
+    "org.aureon.systemoverview",
+)
+GROUP = re.compile(r"^\[Containments\]\[(\d+)\](?:\[Applets\]\[(\d+)\])?$")
+DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_RETRY_INTERVAL_SECONDS = 0.25
+DEFAULT_STABLE_SAMPLES = 2
+
+
+def _invalid(reason: str, **details: object) -> dict[str, object]:
+    return {"state": "invalid", "reason": reason, **details}
+
+
+def _read_snapshot(path: Path) -> tuple[bytes | None, dict[str, object]]:
+    try:
+        before = path.stat()
+        data = path.read_bytes()
+        after = path.stat()
+    except FileNotFoundError:
+        return None, {"reason": "file-missing"}
+    except OSError as error:
+        return None, {"reason": "file-unreadable", "error": error.__class__.__name__}
+
+    before_signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    after_signature = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    snapshot = {
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    if before_signature != after_signature or len(data) != after.st_size:
+        return None, {"reason": "file-changed-during-read", "file": snapshot}
+    if not data:
+        return None, {"reason": "file-empty", "file": snapshot}
+    return data, {"file": snapshot}
+
+
+def inspect(path: Path) -> dict[str, object]:
+    containments: dict[str, dict[str, object]] = {}
+    containment_id: str | None = None
+    applet_id: str | None = None
+
+    data, snapshot = _read_snapshot(path)
+    if data is None:
+        return _invalid(str(snapshot["reason"]), **{k: v for k, v in snapshot.items() if k != "reason"})
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        return _invalid(
+            "parse-invalid",
+            parse_error={"kind": "UnicodeDecodeError", "offset": error.start},
+            **snapshot,
+        )
+
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        match = GROUP.fullmatch(line)
+        if match:
+            containment_id, applet_id = match.groups()
+            containment = containments.setdefault(
+                containment_id, {"settings": {}, "applets": {}}
+            )
+            if applet_id is not None:
+                containment["applets"].setdefault(applet_id, {})
+            continue
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            if not line.endswith("]"):
+                return _invalid(
+                    "parse-invalid",
+                    parse_error={"kind": "unterminated-group", "line": line_number},
+                    **snapshot,
+                )
+            containment_id = None
+            applet_id = None
+            continue
+        if "=" not in line:
+            return _invalid(
+                "parse-invalid",
+                parse_error={"kind": "missing-assignment", "line": line_number},
+                **snapshot,
+            )
+        key, value = line.split("=", 1)
+        if containment_id is None:
+            continue
+        target = containments[containment_id]["settings"]
+        if applet_id is not None:
+            target = containments[containment_id]["applets"][applet_id]
+        target[key.strip()] = value.strip()
+
+    candidates = []
+    for candidate_id, containment in containments.items():
+        settings = containment["settings"]
+        plugins = tuple(
+            applet.get("plugin", "")
+            for applet in containment["applets"].values()
+        )
+        if settings.get("plugin") == "org.kde.panel":
+            missing_plugins = tuple(
+                plugin for plugin in REQUIRED_PLUGINS if plugin not in plugins
+            )
+            candidates.append(
+                {
+                    "id": candidate_id,
+                    "location": settings.get("location"),
+                    "plugins": plugins,
+                    "missing_plugins": missing_plugins,
+                }
+            )
+
+    valid = [
+        panel
+        for panel in candidates
+        if panel["location"] == "4"
+        and all(plugin in panel["plugins"] for plugin in REQUIRED_PLUGINS)
+    ]
+    return {
+        "state": "valid" if valid else "invalid",
+        "reason": "layout-valid" if valid else "panel-incomplete-or-invalid",
+        "panel_count": len(candidates),
+        "valid_panel_count": len(valid),
+        "required_plugins": REQUIRED_PLUGINS,
+        "panels": candidates,
+        **snapshot,
+    }
+
+
+def wait_for_layout(
+    path: Path,
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    retry_interval_seconds: float = DEFAULT_RETRY_INTERVAL_SECONDS,
+    stable_samples: int = DEFAULT_STABLE_SAMPLES,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+    observer: Callable[[Path], dict[str, object]] = inspect,
+) -> dict[str, object]:
+    if timeout_seconds < 0 or retry_interval_seconds <= 0 or stable_samples < 1:
+        raise ValueError("invalid layout readiness timing")
+
+    deadline = clock() + timeout_seconds
+    attempts = 0
+    changes_observed = 0
+    consecutive_valid = 0
+    previous_fingerprint: str | None = None
+    last_observation: dict[str, object] = _invalid("not-observed")
+
+    while True:
+        observation = dict(observer(path))
+        attempts += 1
+        file_details = observation.get("file")
+        fingerprint = (
+            str(file_details.get("sha256"))
+            if isinstance(file_details, dict) and file_details.get("sha256")
+            else None
+        )
+        changed = attempts > 1 and fingerprint != previous_fingerprint
+        if changed:
+            changes_observed += 1
+        observation["changed_since_previous"] = changed
+
+        if observation.get("state") == "valid" and fingerprint is not None:
+            consecutive_valid = consecutive_valid + 1 if fingerprint == previous_fingerprint else 1
+            if consecutive_valid >= stable_samples:
+                return {
+                    "state": "ready",
+                    "reason": "layout-valid-stable",
+                    "attempts": attempts,
+                    "stable_samples": consecutive_valid,
+                    "changes_observed": changes_observed,
+                    "observation": observation,
+                }
+        else:
+            consecutive_valid = 0
+
+        last_observation = observation
+        previous_fingerprint = fingerprint
+        now = clock()
+        if now >= deadline:
+            return {
+                "state": "invalid",
+                "reason": "plasma-panel-layout-invalid",
+                "attempts": attempts,
+                "stable_samples": consecutive_valid,
+                "changes_observed": changes_observed,
+                "observation": last_observation,
+            }
+        sleeper(min(retry_interval_seconds, deadline - now))
+
+
+def main(argv: list[str]) -> int:
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    path = Path(argv[0]) if argv else config_home / "plasma-org.kde.plasma.desktop-appletsrc"
+    timeout_seconds = float(
+        os.environ.get("AUREON_PLASMA_LAYOUT_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
+    )
+    result = wait_for_layout(path, timeout_seconds=timeout_seconds)
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["state"] == "ready" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

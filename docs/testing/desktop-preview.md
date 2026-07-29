@@ -15,7 +15,8 @@ work/qemu-desktop/<id>/
 ```
 
 El `qcow2` base queda de solo lectura y cada apertura utiliza un overlay nuevo.
-La VM no recibe NIC, carpetas compartidas, USB físico ni rutas de discos del
+La VM gaming recibe red NAT de usuario para Steam, sin publicar puertos
+entrantes. No recibe carpetas compartidas, USB físico ni rutas de discos del
 host.
 
 ## Próxima validación del lote 2–6
@@ -39,6 +40,11 @@ modo. KScreen selecciona y vuelve a observar el modo desde JSON. Plasma se
 inicia con el wrapper D-Bus oficial incluido por Fedora, y QEMU conserva una
 captura interna PPM mediante QMP local. Esto permite distinguir un framebuffer
 guest correcto de un fallo de presentación GTK/WSLg.
+
+La ventana QEMU usa pantalla completa y escalado proporcional `zoom-to-fit`:
+mantiene el framebuffer Full HD del guest, pero adapta todo el escritorio al
+área visible de WSLg para que el panel inferior no quede fuera de la ventana
+en pantallas con menos altura disponible.
 
 ## Abrir una imagen validada sin reconstruir
 

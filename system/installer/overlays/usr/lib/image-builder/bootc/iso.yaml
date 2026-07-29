@@ -1,0 +1,12 @@
+label: "Aureon-0-1"
+grub2:
+  entries:
+    - name: "Probar Aureon sin instalar"
+      linux: "/images/pxeboot/vmlinuz root=live:CDLABEL=Aureon-0-1 rd.live.image systemd.unit=graphical.target enforcing=0 rw quiet"
+      initrd: "/images/pxeboot/initrd.img"
+    - name: "Instalar Aureon (modo texto)"
+      linux: "/images/pxeboot/vmlinuz inst.stage2=hd:LABEL=Aureon-0-1 root=live:CDLABEL=Aureon-0-1 rd.live.image systemd.unit=anaconda.target inst.text enforcing=0 rw"
+      initrd: "/images/pxeboot/initrd.img"
+    - name: "Probar Aureon (graficos basicos)"
+      linux: "/images/pxeboot/vmlinuz root=live:CDLABEL=Aureon-0-1 rd.live.image systemd.unit=graphical.target nomodeset enforcing=0 rw"
+      initrd: "/images/pxeboot/initrd.img"

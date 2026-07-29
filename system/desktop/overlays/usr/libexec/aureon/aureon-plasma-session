@@ -21,15 +21,50 @@ if [ "${AUREON_PLASMA_INNER:-0}" != "1" ]; then
     exec /usr/libexec/plasma-dbus-run-session-if-needed "$0"
 fi
 
-runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-state_dir="${runtime_dir}/aureon"
+state_dir="${AUREON_DESKTOP_STATE_DIR:-/run/aureon-desktop-ready}"
+launcher_file="${state_dir}/launcher-state"
+launcher_temporary="${launcher_file}.$$"
 umask 077
 install -d -m 0700 "$state_dir"
-printf 'launcher_state=starting-plasma\n' > "${state_dir}/launcher-state"
+
+write_launcher_state() {
+    {
+        printf 'launcher_state=%s\n' "$1"
+        shift
+        if [ "$#" -gt 0 ]; then
+            printf '%s\n' "$@"
+        fi
+    } > "$launcher_temporary"
+    chmod 0600 "$launcher_temporary"
+    mv -f "$launcher_temporary" "$launcher_file"
+}
+
+write_launcher_state "starting-probe"
+
+# XDG autostart is deliberately retained as a fallback, but the preview's
+# readiness contract cannot depend on Plasma discovering it.  The probe has an
+# atomic single-instance guard, so starting it here is deterministic.
+if /usr/libexec/aureon/aureon-session-ready &
+then
+    probe_pid=$!
+else
+    write_launcher_state "probe-start-failed" "failure_reason=probe-exec-failed"
+    exit 1
+fi
+sleep 1
+if ! kill -0 "$probe_pid" 2>/dev/null; then
+    if [ ! -r "${state_dir}/session-state" ]; then
+        write_launcher_state "probe-start-failed" \
+            "probe_pid=${probe_pid}" \
+            "failure_reason=probe-exited-without-state"
+        exit 1
+    fi
+fi
+write_launcher_state "starting-plasma" "probe_pid=${probe_pid}"
 
 set +e
 /usr/bin/startplasma-wayland
 status=$?
 set -e
-printf 'launcher_state=plasma-exited\nexit_code=%s\n' "$status" > "${state_dir}/launcher-state"
+write_launcher_state "plasma-exited" "exit_code=${status}" "probe_pid=${probe_pid}"
 exit "$status"

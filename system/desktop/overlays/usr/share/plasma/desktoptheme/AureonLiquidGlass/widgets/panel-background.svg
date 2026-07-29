@@ -2,14 +2,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="180" height="180" viewBox="0 0 180 180">
   <defs>
     <linearGradient id="liquid" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#ffffff" stop-opacity="0.46"/>
-      <stop offset="0.45" stop-color="#b9e9ff" stop-opacity="0.24"/>
-      <stop offset="1" stop-color="#a99bff" stop-opacity="0.30"/>
+      <stop offset="0" stop-color="#293849" stop-opacity="0.88"/>
+      <stop offset="0.48" stop-color="#152536" stop-opacity="0.82"/>
+      <stop offset="1" stop-color="#261f3d" stop-opacity="0.86"/>
     </linearGradient>
     <linearGradient id="edge" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#ffffff" stop-opacity="0.76"/>
-      <stop offset="0.35" stop-color="#effbff" stop-opacity="0.25"/>
-      <stop offset="1" stop-color="#618fc2" stop-opacity="0.14"/>
+      <stop offset="0" stop-color="#e8f8ff" stop-opacity="0.62"/>
+      <stop offset="0.18" stop-color="#8bdcff" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#6e5cb8" stop-opacity="0.12"/>
     </linearGradient>
   </defs>
   <g id="hint-stretch-borders" opacity="0"><rect x="36" y="36" width="108" height="108"/></g>
@@ -17,9 +17,9 @@
   <g id="top"><rect x="28" y="6" width="124" height="22" fill="url(#edge)"/></g>
   <g id="topright"><path d="M152 6H164Q174 6 174 16V28H152Z" fill="url(#liquid)" stroke="#effbff" stroke-opacity="0.35"/></g>
   <g id="left"><rect x="6" y="28" width="22" height="124" fill="url(#liquid)"/></g>
-  <g id="center"><rect x="28" y="28" width="124" height="124" fill="#d8f2ff" fill-opacity="0.20"/></g>
+  <g id="center"><rect x="28" y="28" width="124" height="124" fill="#111a27" fill-opacity="0.84"/></g>
   <g id="right"><rect x="152" y="28" width="22" height="124" fill="url(#liquid)"/></g>
   <g id="bottomleft"><path d="M6 152H28V174H16Q6 174 6 164Z" fill="url(#liquid)" stroke="#8dd8ff" stroke-opacity="0.20"/></g>
-  <g id="bottom"><rect x="28" y="152" width="124" height="22" fill="#bddfff" fill-opacity="0.16"/></g>
+  <g id="bottom"><rect x="28" y="152" width="124" height="22" fill="#101824" fill-opacity="0.88"/></g>
   <g id="bottomright"><path d="M152 152H174V164Q174 174 164 174H152Z" fill="url(#liquid)" stroke="#8dd8ff" stroke-opacity="0.20"/></g>
 </svg>

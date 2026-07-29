@@ -1,10 +1,27 @@
 {
   "schema": "aureon.appearance-profiles",
-  "version": 1,
-  "default_profile": "balanced",
+  "version": 2,
+  "default_style": "carbon",
+  "styles": {
+    "carbon": {
+      "name": "Aureon Carbon",
+      "color_scheme": "AureonCarbon",
+      "plasma_theme": "AureonCarbon",
+      "wallpaper": "AureonCarbon",
+      "description": "Negro carbón sobrio, alto contraste y superficies sólidas."
+    },
+    "liquid-glass": {
+      "name": "Aureon Liquid Glass",
+      "color_scheme": "AureonLiquidGlass",
+      "plasma_theme": "AureonLiquidGlass",
+      "wallpaper": "AureonLiquidGlass",
+      "description": "Vidrio oscuro opcional con profundidad, reflejos contenidos y acentos azul-violeta."
+    }
+  },
+  "default_profile": "off",
   "profiles": {
     "off": {
-      "description": "Sin transparencia adicional; máxima legibilidad y menor coste visual.",
+      "description": "Predeterminado Carbon: sin transparencia adicional, máxima legibilidad y menor coste visual.",
       "blur": "disabled",
       "transparency": "disabled",
       "motion": "reduced"
@@ -16,7 +33,7 @@
       "motion": "normal"
     },
     "balanced": {
-      "description": "Perfil Liquid Glass predeterminado: capas suaves, contraste alto y panel flotante.",
+      "description": "Liquid Glass equilibrado: capas profundas, contraste alto y transparencia contenida.",
       "blur": "moderate",
       "transparency": "moderate",
       "motion": "normal"

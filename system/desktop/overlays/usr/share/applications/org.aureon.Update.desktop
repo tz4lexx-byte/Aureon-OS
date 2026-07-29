@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Actualizar Aureon
+Comment=Actualizar el sistema y las aplicaciones de forma atómica
+Icon=system-software-update
+Exec=konsole --hold -e pkexec /usr/libexec/aureon/aureon-update apply
+Categories=System;Settings;
+Keywords=update;upgrade;actualizar;sistema;aplicaciones;
+Terminal=false

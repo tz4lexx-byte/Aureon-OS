@@ -61,7 +61,7 @@ class DesktopPreviewTests(unittest.TestCase):
         self.assertEqual(first_output, second_output)
         self.assertEqual(plan["command"], "desktop-preview")
         self.assertTrue(plan["execution"]["allow_build_network_required"])
-        self.assertEqual(plan["execution"]["guest_network"], "disabled")
+        self.assertEqual(plan["execution"]["guest_network"], "qemu-user-nat-no-inbound-forwarding")
         self.assertEqual(plan["execution"]["video_adapter"], "virtio")
         self.assertEqual(plan["execution"]["gtk_backend"], "x11")
         self.assertEqual(plan["execution"]["requested_display"]["width"], 1920)
@@ -127,6 +127,29 @@ class DesktopPreviewTests(unittest.TestCase):
         self.assertEqual(evidence["core"], report)
         self.assertEqual(state["display_requested"], "1920x1080@60")
         self.assertEqual(state["display_state"], "observed-1920x1080@60")
+
+    def test_guest_evidence_recovers_from_interleaved_serial_chunks(self):
+        report = {
+            "schema": "aureon.control-plane-report",
+            "version": 1,
+            "result": {"state": "passed", "details": "x" * 900},
+        }
+        encoded = self.tool.base64.b64encode(json.dumps(report).encode("utf-8")).decode("ascii")
+        chunks = [encoded[offset : offset + 512] for offset in range(0, len(encoded), 512)]
+        lines = []
+        for index, chunk in enumerate(chunks, start=1):
+            line = (
+                f"[  83.0] aureon-wait-desktop-ready[1017]: "
+                f"AUREON_EVIDENCE_CHUNK name=services index={index:04d} "
+                f"total={len(chunks):04d} data={chunk}"
+            )
+            lines.extend((line, "[  83.0] audit: interleaved", line))
+        with tempfile.TemporaryDirectory() as directory:
+            serial = Path(directory) / "serial.log"
+            serial.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            evidence = self.tool._extract_guest_evidence(serial)
+
+        self.assertEqual(evidence["services"], report)
 
     def test_execute_requires_explicit_network_acknowledgement_before_preflight(self):
         with mock.patch.object(
@@ -196,10 +219,11 @@ class DesktopPreviewTests(unittest.TestCase):
         joined = " ".join(command)
         portable_joined = joined.replace("\\", "/")
 
-        self.assertIn("-display gtk,gl=off,zoom-to-fit=off,show-tabs=off", joined)
+        self.assertIn("-display gtk,gl=off,zoom-to-fit=on,full-screen=on,show-tabs=off", joined)
         self.assertIn("-device virtio-vga,edid=on,xres=1920,yres=1080,max_outputs=1", joined)
         self.assertIn("-device usb-kbd,bus=xhci.0", joined)
-        self.assertIn("-nic none", joined)
+        self.assertIn("-nic user,model=virtio-net-pci", joined)
+        self.assertNotIn("hostfwd=", joined)
         self.assertIn("-qmp unix:/run/aureon-desktop-preview/", portable_joined)
         self.assertNotIn("tcp:", joined)
         self.assertIn("readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd", portable_joined)
@@ -214,7 +238,8 @@ class DesktopPreviewTests(unittest.TestCase):
         joined = " ".join(command)
 
         self.assertIn("-device virtio-vga,edid=on,xres=1920,yres=1080,max_outputs=1", joined)
-        self.assertIn("-nic none", joined)
+        self.assertIn("-nic user,model=virtio-net-pci", joined)
+        self.assertNotIn("hostfwd=", joined)
 
     def test_existing_preview_plan_records_full_hd_compatibility_video(self):
         status, output = self.invoke(
