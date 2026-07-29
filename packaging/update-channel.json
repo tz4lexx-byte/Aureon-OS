@@ -1,0 +1,9 @@
+{
+  "schema": "aureon.update-channel",
+  "version": 1,
+  "source_repository": "https://github.com/tz4lexx-byte/Aureon-OS",
+  "stable_image": "ghcr.io/tz4lexx-byte/aureon-os:stable",
+  "visibility": "public",
+  "automatic_reboot": false,
+  "flatpak_scope": "system"
+}

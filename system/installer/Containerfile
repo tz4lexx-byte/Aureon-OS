@@ -1,0 +1,52 @@
+# Aureon USB environment. The payload is the already-built and inspected
+# desktop image; this layer adds only the live-media and interactive installer.
+ARG AUREON_PAYLOAD=localhost/aureon-desktop-preview:payload
+FROM ${AUREON_PAYLOAD}
+ARG AUREON_TARGET_REF=localhost/aureon-os:stable
+
+RUN dnf -y install \
+      anaconda \
+      anaconda-install-img-deps \
+      anaconda-dracut \
+      dracut-config-generic \
+      dracut-live \
+      dracut-network \
+      grub2-common \
+      grub2-efi-x64-cdboot \
+      grub2-pc-modules \
+      shim-x64 \
+      squashfs-tools \
+      xorriso \
+      isomd5sum \
+      net-tools \
+      default-fonts-core-sans \
+      default-fonts-other-sans && \
+    dnf -y clean all && \
+    rm -rf /var/cache/dnf && \
+    install -d -m 0755 /boot/efi /var/mnt && \
+    cp -a /usr/lib/efi/*/*/EFI /boot/efi/
+
+COPY overlays/ /
+
+# Generate the generic live initramfs expected by image-builder. The installer
+# remains interactive: no clearpart, autopart, ignoredisk or target disk exists
+# anywhere in this image.
+RUN kernel="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -n 1)" && \
+    seccomp="$(readlink -f /usr/lib64/libseccomp.so.2)" && \
+    sed -i "s|@@AUREON_TARGET_REF@@|${AUREON_TARGET_REF}|g" \
+      /usr/share/anaconda/interactive-defaults.ks && \
+    ! grep -q '@@AUREON_TARGET_REF@@' \
+      /usr/share/anaconda/interactive-defaults.ks && \
+    test -n "${kernel}" && \
+    test -f "${seccomp}" && \
+    DRACUT_NO_XATTR=1 dracut --force --zstd --reproducible --no-hostonly \
+      --add "dmsquash-live anaconda" \
+      --install "/usr/lib64/libseccomp.so.2 ${seccomp}" \
+      "/usr/lib/modules/${kernel}/initramfs.img" "${kernel}" && \
+    chmod 0644 \
+      /usr/lib/image-builder/bootc/iso.yaml \
+      /usr/share/anaconda/interactive-defaults.ks \
+      /usr/lib/systemd/system/anaconda.service.d/20-aureon-installer.conf \
+      /usr/lib/systemd/system/bootloader-update.service.d/20-aureon-live.conf \
+      /etc/polkit-1/rules.d/49-aureon-live-network.rules && \
+    chmod 0755 /usr/local/bin/bootc

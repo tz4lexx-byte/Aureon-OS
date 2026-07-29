@@ -1,11 +1,12 @@
 var panel = new Panel;
 
 panel.location = "bottom";
-panel.height = 42;
+panel.height = 52;
 panel.alignment = "center";
-panel.lengthMode = "fit";
+panel.lengthMode = "fill";
+panel.hiding = "none";
 panel.opacity = "translucent";
-panel.floating = true;
+panel.floating = false;
 
 panel.addWidget("org.kde.plasma.kickoff");
 panel.addWidget("org.kde.plasma.pager");

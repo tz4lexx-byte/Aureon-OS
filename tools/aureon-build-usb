@@ -1,0 +1,285 @@
+#!/usr/bin/python3
+"""Build an Aureon x86-64 Live USB / interactive installer ISO inside WSL."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+STORE = Path("/var/lib/aureon-phase0-podman/storage")
+RUNROOT = Path("/run/aureon-phase0-podman")
+BUILDER = (
+    "ghcr.io/osbuild/image-builder-cli@sha256:"
+    "700368cfa3e78b25fb4fe02a87cedf1a5bc0cb142d7287c8c6fff72fd09228f5"
+)
+UPDATE_CHANNEL = ROOT / "packaging" / "update-channel.json"
+
+
+class UsbBuildError(RuntimeError):
+    pass
+
+
+def build_id(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value):
+        raise argparse.ArgumentTypeError("build-id inválido")
+    return value
+
+
+def update_image_ref(value: str) -> str:
+    if not re.fullmatch(
+        r"(?!localhost(?:[:/]|$))[a-z0-9.-]+(?::[0-9]+)?/"
+        r"[a-z0-9._/-]+:[A-Za-z0-9._-]+",
+        value,
+    ):
+        raise argparse.ArgumentTypeError(
+            "la referencia de actualización debe ser remota y etiquetada, "
+            "por ejemplo ghcr.io/propietario/aureon:stable"
+        )
+    return value
+
+
+def default_update_image_ref() -> str:
+    try:
+        payload = json.loads(UPDATE_CHANNEL.read_text(encoding="utf-8"))
+        value = payload["stable_image"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise UsbBuildError(
+            "packaging/update-channel.json no define stable_image"
+        ) from error
+    try:
+        return update_image_ref(value)
+    except argparse.ArgumentTypeError as error:
+        raise UsbBuildError(str(error)) from error
+
+
+def confined(path: Path) -> Path:
+    lexical = Path(os.path.abspath(path))
+    try:
+        lexical.relative_to(ROOT)
+    except ValueError as error:
+        raise UsbBuildError(f"ruta fuera del proyecto: {path}") from error
+    if any(parent.is_symlink() for parent in (lexical, *lexical.parents) if parent != ROOT.parent):
+        raise UsbBuildError(f"la ruta atraviesa un enlace simbólico: {path}")
+    return lexical
+
+
+def paths(identifier: str) -> dict[str, Path]:
+    build = confined(ROOT / "build" / f"usb-{identifier}")
+    image = confined(ROOT / "images" / f"usb-{identifier}")
+    return {
+        "build": build,
+        "image": image,
+        "plan": build / "plan.json",
+        "payload_log": build / "payload-oci.log",
+        "installer_log": build / "installer-oci.log",
+        "iso_log": build / "iso-build.log",
+        "evidence": build / "result.json",
+        "iso": image / "aureon-live-installer.iso",
+    }
+
+
+def source_digest() -> str:
+    digest = hashlib.sha256()
+    for base in (ROOT / "system" / "desktop", ROOT / "system" / "installer"):
+        for path in sorted(item for item in base.rglob("*") if item.is_file()):
+            relative = path.relative_to(ROOT).as_posix()
+            digest.update(relative.encode() + b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    digest.update((ROOT / "packaging" / "desktop-profile.json").read_bytes())
+    digest.update(UPDATE_CHANNEL.read_bytes())
+    return digest.hexdigest()
+
+
+def plan(identifier: str, update_ref: str | None = None) -> dict:
+    output = paths(identifier)
+    return {
+        "schema": "aureon.usb-build-plan",
+        "version": 1,
+        "build_id": identifier,
+        "source_digest": source_digest(),
+        "architecture": "x86_64",
+        "firmware": ["UEFI", "UEFI Secure Boot with Fedora shim"],
+        "boot_entries": [
+            "Probar Aureon sin instalar",
+            "Instalar Aureon (interactivo)",
+            "Probar Aureon (graficos basicos)",
+        ],
+        "installer_safety": {
+            "automatic_disk_selection": False,
+            "automatic_partitioning": False,
+            "automatic_firmware_changes": False,
+            "physical_drive_argument_accepted": False,
+        },
+        "network": "solo durante builds OCI explícitos; ISO autocontenido",
+        "update_channel": {
+            "configured": update_ref is not None,
+            "image_ref": update_ref,
+            "atomic_system_updates": update_ref is not None,
+            "flatpak_updates": True,
+        },
+        "installer_resources": {
+            "live_root_heavy_workspace": False,
+            "bootc_workspace": "target-filesystem:/var/tmp/aureon-bootc-install",
+            "activity_interval_seconds": 5,
+            "workspace_removed_after_install": True,
+        },
+        "output": output["iso"].relative_to(ROOT).as_posix(),
+    }
+
+
+def run(argv: list[str], log: Path, timeout: int = 7200) -> None:
+    with log.open("x", encoding="utf-8") as handle:
+        result = subprocess.run(argv, stdout=handle, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+    if result.returncode:
+        raise UsbBuildError(f"{argv[0]} terminó con {result.returncode}; revisa {log.relative_to(ROOT)}")
+
+
+def capture(argv: list[str]) -> str:
+    result = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=120)
+    if result.returncode:
+        raise UsbBuildError((result.stderr or result.stdout).strip()[:400])
+    return result.stdout.strip()
+
+
+def execute(identifier: str, allow_network: bool, update_ref: str | None) -> dict:
+    if not allow_network:
+        raise UsbBuildError("--execute requiere --allow-build-network")
+    if update_ref is None:
+        raise UsbBuildError(
+            "--execute requiere --update-image-ref para habilitar "
+            "actualizaciones posteriores a la instalación"
+        )
+    if os.geteuid() != 0:
+        raise UsbBuildError("la construcción debe ejecutarse con sudo dentro de WSL")
+    if platform.system() != "Linux" or "microsoft" not in Path("/proc/sys/kernel/osrelease").read_text().lower():
+        raise UsbBuildError("esta herramienta solo construye dentro de WSL")
+    if shutil.disk_usage(ROOT).free < 8 * 1024**3:
+        raise UsbBuildError("se requieren al menos 8 GiB libres para conservar el ISO final")
+
+    output = paths(identifier)
+    if output["build"].exists() or output["image"].exists():
+        raise UsbBuildError("el build-id ya existe; no se sobrescribirá")
+    output["build"].mkdir(parents=True)
+    output["image"].mkdir(parents=True)
+    output["plan"].write_text(
+        json.dumps(plan(identifier, update_ref), indent=2, sort_keys=True) + "\n"
+    )
+
+    podman = [
+        "/usr/bin/podman", "--root", str(STORE), "--runroot", str(RUNROOT),
+        "--storage-driver", "overlay",
+    ]
+    payload_tag = f"localhost/aureon-desktop-preview:{identifier}"
+    payload_alias = "localhost/aureon-desktop-preview:payload"
+    installer_tag = f"localhost/aureon-installer:{identifier}"
+    run(
+        podman + [
+            "build", "--pull=never", "--network=host", "--http-proxy=false",
+            "--format", "oci",
+            "-f", str(ROOT / "system/desktop/Containerfile"),
+            "-t", payload_tag, str(ROOT / "system/desktop"),
+        ],
+        output["payload_log"],
+    )
+    payload_digest = capture(podman + ["image", "inspect", "--format", "{{.Digest}}", payload_tag])
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", payload_digest):
+        raise UsbBuildError("el payload no produjo un digest inmutable")
+    immutable_payload = f"localhost/aureon-desktop-preview@{payload_digest}"
+    run(podman + ["tag", immutable_payload, payload_alias], output["build"] / "payload-tag.log", 120)
+    run(
+        podman + [
+            "build", "--pull=never", "--network=host", "--http-proxy=false",
+            "--format", "oci",
+            "--build-arg", f"AUREON_PAYLOAD={immutable_payload}",
+            "--build-arg", f"AUREON_TARGET_REF={update_ref}",
+            "-f", str(ROOT / "system/installer/Containerfile"),
+            "-t", installer_tag, str(ROOT / "system/installer"),
+        ],
+        output["installer_log"],
+    )
+    installer_digest = capture(podman + ["image", "inspect", "--format", "{{.Digest}}", installer_tag])
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", installer_digest):
+        raise UsbBuildError("el instalador no produjo un digest inmutable")
+    immutable_installer = f"localhost/aureon-installer@{installer_digest}"
+
+    run(
+        podman + [
+            "run", "--rm", "--privileged", "--pull=never", "--network=none",
+            "-e", "CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf",
+            "-v", "/var/lib/aureon-phase0-podman/config/storage.conf:/etc/containers/storage.conf:ro",
+            "-v", f"{STORE}:{STORE}:rw",
+            "-v", f"{STORE}:/var/lib/containers/storage:rw",
+            "-v", f"{output['image']}:/output:rw",
+            BUILDER, "--output-dir", "/output", "build", "bootc-generic-iso",
+            "--bootc-ref", immutable_installer,
+            "--bootc-installer-payload-ref", payload_alias,
+            "--bootc-default-fs", "ext4",
+            "--output-name", "aureon-live-installer",
+            "--with-manifest", "--with-buildlog", "--progress", "verbose",
+        ],
+        output["iso_log"],
+        10800,
+    )
+    candidates = sorted(output["image"].glob("aureon-live-installer*.iso"))
+    if len(candidates) != 1:
+        raise UsbBuildError("image-builder no produjo exactamente un ISO")
+    if candidates[0] != output["iso"]:
+        candidates[0].rename(output["iso"])
+    iso_hash = hashlib.sha256(output["iso"].read_bytes()).hexdigest()
+    result = {
+        "schema": "aureon.usb-build-result",
+        "version": 1,
+        "status": "built-not-yet-boot-validated",
+        "build_id": identifier,
+        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "payload": immutable_payload,
+        "installer": immutable_installer,
+        "iso": output["iso"].relative_to(ROOT).as_posix(),
+        "iso_bytes": output["iso"].stat().st_size,
+        "iso_sha256": iso_hash,
+    }
+    output["evidence"].write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--build-id", required=True, type=build_id)
+    parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--allow-build-network", action="store_true")
+    parser.add_argument("--update-image-ref", type=update_image_ref)
+    arguments = parser.parse_args(argv)
+    try:
+        selected_update_ref = (
+            arguments.update_image_ref or default_update_image_ref()
+        )
+        payload = (
+            execute(
+                arguments.build_id,
+                arguments.allow_build_network,
+                selected_update_ref,
+            )
+            if arguments.execute
+            else plan(arguments.build_id, selected_update_ref)
+        )
+    except (OSError, subprocess.TimeoutExpired, UsbBuildError) as error:
+        print(f"aureon-build-usb: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

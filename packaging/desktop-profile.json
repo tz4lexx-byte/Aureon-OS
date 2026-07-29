@@ -16,16 +16,41 @@
     "dbus-daemon",
     "plasma-desktop",
     "plasma-workspace",
-    "plasma-workspace-wayland",
-    "kwin-wayland",
     "libkscreen",
     "xdg-desktop-portal-kde",
+    "plasma-discover",
+    "plasma-discover-flatpak",
+    "plasma-systemmonitor",
+    "flatpak",
+    "NetworkManager-wifi",
+    "bluez",
+    "bluez-tools",
+    "rfkill",
+    "powerdevil",
+    "tuned-ppd",
+    "brightnessctl",
+    "libinput-utils",
+    "v4l-utils",
+    "alsa-utils",
+    "iio-sensor-proxy",
+    "switcheroo-control",
     "mesa-dri-drivers",
+    "mesa-vulkan-drivers",
+    "mesa-va-drivers",
+    "vulkan-loader",
     "pipewire",
+    "pipewire-alsa",
+    "pipewire-pulseaudio",
     "python3",
     "wireplumber",
     "dolphin",
-    "konsole"
+    "konsole",
+    "firefox",
+    "libreoffice",
+    "ffmpeg-free",
+    "ark",
+    "kate",
+    "spectacle"
   ],
   "diagnostic_packages": [
     "pciutils",
@@ -33,10 +58,35 @@
     "vulkan-tools"
   ],
   "optional_components": {
-    "gaming": ["steam", "wine", "proton", "gamescope"],
-    "streaming": ["obs-studio"],
+    "gaming": ["steam", "proton", "wine", "gamescope", "mangohud", "goverlay", "heroic"],
+    "streaming": ["obs-studio", "kdenlive"],
     "development": ["git", "gcc", "python3"],
     "competitive": []
+  },
+  "preinstalled_flatpaks": [
+    {
+      "app_id": "com.valvesoftware.Steam",
+      "remote": "flathub",
+      "channel": "stable",
+      "maintainer": "community",
+      "verified_by_vendor": false
+    },
+    {
+      "app_id": "com.obsproject.Studio",
+      "remote": "flathub",
+      "channel": "stable",
+      "maintainer": "OBS Project",
+      "verified_by_vendor": true
+    }
+  ],
+  "gaming_device_rules": {
+    "source": "https://github.com/ValveSoftware/steam-devices",
+    "commit": "22ec85e5ff5ea2e15c56d71a41bcbef46356cd60",
+    "license": "MIT",
+    "files": [
+      "60-steam-input.rules",
+      "60-steam-vr.rules"
+    ]
   },
   "prohibited_automatic_components": [
     "proprietary-gpu-driver",

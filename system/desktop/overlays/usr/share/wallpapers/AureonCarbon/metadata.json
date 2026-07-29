@@ -1,0 +1,8 @@
+{
+  "KPlugin": {
+    "Id": "AureonCarbon",
+    "Name": "Aureon Carbon",
+    "License": "CC0-1.0",
+    "Authors": [{"Name": "Aureon OS Project"}]
+  }
+}

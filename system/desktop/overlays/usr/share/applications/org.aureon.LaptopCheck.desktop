@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Compatibilidad de laptop
+Comment=Revisar Wi-Fi, Bluetooth, audio, cámara, touchpad, energía y gráficos
+Icon=computer-laptop
+Exec=konsole --hold -e aureon-laptop-check
+Categories=System;Utility;
+Terminal=false

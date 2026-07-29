@@ -150,7 +150,8 @@ class AureonControlPlaneTests(unittest.TestCase):
         for package in profile["core_packages"] + profile["diagnostic_packages"]:
             self.assertIn(package, containerfile)
         self.assertTrue(profile["package_resolution"]["lock_required_for_release"])
-        self.assertNotIn("steam", containerfile.lower())
+        self.assertNotIn("dnf -y install steam", containerfile.lower())
+        self.assertIn("com.valvesoftware.Steam", containerfile)
         self.assertNotIn("obs-studio", containerfile.lower())
 
     def test_named_phase_commands_are_safe_wrappers_around_the_control_plane(self):

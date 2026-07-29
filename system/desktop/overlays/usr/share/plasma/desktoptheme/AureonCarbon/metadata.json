@@ -1,0 +1,12 @@
+{
+  "KPlugin": {
+    "Authors": [{"Name": "Aureon OS Project"}],
+    "Description": "Carbon-black, high-contrast desktop surfaces for Aureon",
+    "EnabledByDefault": true,
+    "Id": "AureonCarbon",
+    "License": "GPL-3.0-or-later",
+    "Name": "Aureon Carbon",
+    "Version": "1.0.0"
+  },
+  "X-Plasma-API": "5.0"
+}

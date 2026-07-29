@@ -1,0 +1,92 @@
+#!/usr/bin/bash
+# Aureon interactive post-install updater.
+
+set -u
+
+usage() {
+    echo "Uso: aureon-update {status|check|apply|rollback}" >&2
+    exit 2
+}
+
+require_root() {
+    if (( EUID != 0 )); then
+        echo "Esta acción requiere autenticación de administrador." >&2
+        exit 1
+    fi
+}
+
+separator() {
+    printf '\n== %s ==\n' "$1"
+}
+
+case ${1-} in
+    status)
+        separator "Sistema"
+        bootc status
+        separator "Aplicaciones"
+        flatpak remote-ls --system --updates 2>/dev/null || true
+        ;;
+    check)
+        require_root
+        separator "Buscando actualización atómica de Aureon"
+        bootc upgrade --check
+        separator "Buscando actualizaciones de aplicaciones"
+        flatpak remote-ls --system --updates
+        ;;
+    apply)
+        require_root
+        echo "Aureon preparará una actualización atómica del sistema y actualizará aplicaciones."
+        echo "El sistema actual seguirá disponible para recuperación."
+        read -r -p "¿Continuar? [s/N]: " answer
+        case ${answer} in
+            s|S|si|SI|sí|Sí) ;;
+            *) echo "Actualización cancelada."; exit 0 ;;
+        esac
+
+        system_status=0
+        apps_status=0
+
+        separator "Sistema Aureon"
+        bootc upgrade || system_status=$?
+
+        separator "Aplicaciones Flatpak"
+        flatpak update --system --noninteractive --assumeyes || apps_status=$?
+        if (( apps_status == 0 )); then
+            echo "Limpiando runtimes Flatpak que ya no utiliza ninguna aplicación..."
+            flatpak uninstall --system --unused --noninteractive --assumeyes || true
+        fi
+
+        separator "Resultado"
+        if (( system_status == 0 )); then
+            echo "Sistema: despliegue comprobado/preparado correctamente."
+        else
+            echo "Sistema: no se pudo preparar la actualización (código ${system_status})." >&2
+        fi
+        if (( apps_status == 0 )); then
+            echo "Aplicaciones: actualizadas correctamente."
+        else
+            echo "Aplicaciones: actualización incompleta (código ${apps_status})." >&2
+        fi
+
+        if (( system_status != 0 && apps_status != 0 )); then
+            exit 1
+        fi
+
+        echo
+        echo "No se reiniciará automáticamente."
+        echo "Cuando estés listo, reinicia desde el menú normal de Aureon."
+        ;;
+    rollback)
+        require_root
+        echo "Esto seleccionará el despliegue anterior para el próximo arranque."
+        read -r -p "¿Preparar rollback? [s/N]: " answer
+        case ${answer} in
+            s|S|si|SI|sí|Sí) bootc rollback ;;
+            *) echo "Rollback cancelado." ;;
+        esac
+        echo "No se reiniciará automáticamente."
+        ;;
+    *)
+        usage
+        ;;
+esac

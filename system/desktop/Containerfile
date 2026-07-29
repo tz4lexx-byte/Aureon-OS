@@ -2,7 +2,7 @@
 #
 # This is intentionally separate from ../Containerfile: Phase 0 stays a
 # headless, auto-shutting smoke image while this profile is an interactive VM.
-FROM quay.io/fedora/fedora-bootc@sha256:86cd97f1e7962e30f52f35ae1c0719299df4f681492b133ea4bcdb74d154fb92
+FROM quay.io/fedora/fedora-bootc@sha256:4fb9e17562eb399ebfdea86780026b867f7c556e86256d6584a1018fc14cf2cc
 
 LABEL org.opencontainers.image.title="Aureon OS Desktop Preview"
 LABEL org.opencontainers.image.description="KDE Plasma preview for an isolated QEMU VM only"
@@ -25,18 +25,69 @@ RUN mkdir -p /var/roothome && \
       kwin-wayland \
       libkscreen \
       xdg-desktop-portal-kde \
+      plasma-discover \
+      plasma-discover-flatpak \
+      plasma-systemmonitor \
+      flatpak \
+      NetworkManager-wifi \
+      bluez \
+      bluez-tools \
+      rfkill \
+      powerdevil \
+      tuned-ppd \
+      brightnessctl \
+      libinput-utils \
+      v4l-utils \
+      alsa-utils \
+      iio-sensor-proxy \
+      switcheroo-control \
       mesa-dri-drivers \
+      mesa-vulkan-drivers \
+      mesa-va-drivers \
+      vulkan-loader \
       pciutils \
       pipewire \
+      pipewire-alsa \
+      pipewire-pulseaudio \
       procps-ng \
       python3 \
       usbutils \
       vulkan-tools \
       wireplumber \
       dolphin \
-      konsole && \
+      konsole \
+      firefox \
+      libreoffice \
+      ffmpeg-free \
+      ark \
+      kate \
+      spectacle && \
     dnf -y clean all && \
     rm -rf /var/cache/dnf
+
+# Aureon Gaming preview. Steam is installed as the community-maintained
+# Flathub application instead of mixing third-party RPM repositories into the
+# immutable bootc core. The preview build already requires explicit network
+# consent and records its resulting package/application inventory.
+RUN flatpak remote-add --system --if-not-exists \
+      flathub https://dl.flathub.org/repo/flathub.flatpakrepo && \
+    flatpak install --system --noninteractive --assumeyes \
+      flathub com.valvesoftware.Steam \
+      com.obsproject.Studio
+
+# Host-side input permissions required by Steam Flatpak. Pin Valve's reviewed
+# MIT-licensed rules by commit and verify both payloads before installing them.
+RUN steam_devices_commit=22ec85e5ff5ea2e15c56d71a41bcbef46356cd60 && \
+    install -d -m 0755 /usr/lib/udev/rules.d && \
+    curl -fsSL -o /tmp/60-steam-input.rules \
+      "https://raw.githubusercontent.com/ValveSoftware/steam-devices/${steam_devices_commit}/60-steam-input.rules" && \
+    echo "284930f83cf8fde8a247057d46f48083d5e4aefc23a54310db02cfc2dbe42e50  /tmp/60-steam-input.rules" | sha256sum -c - && \
+    curl -fsSL -o /tmp/60-steam-vr.rules \
+      "https://raw.githubusercontent.com/ValveSoftware/steam-devices/${steam_devices_commit}/60-steam-vr.rules" && \
+    echo "e12cda322c9f5f7c6336d8048264877690d3488e1b0f1b750cce18a836160420  /tmp/60-steam-vr.rules" | sha256sum -c - && \
+    install -m 0644 /tmp/60-steam-input.rules /usr/lib/udev/rules.d/60-steam-input.rules && \
+    install -m 0644 /tmp/60-steam-vr.rules /usr/lib/udev/rules.d/60-steam-vr.rules && \
+    rm -f /tmp/60-steam-input.rules /tmp/60-steam-vr.rules
 
 COPY overlays/ /
 
@@ -44,13 +95,15 @@ COPY overlays/ /
 # is deliberately not a sudo/wheel user.  greetd starts Plasma for it once per
 # boot, so no PC password, guest password, SSH key, or remote login is needed.
 RUN chmod 0644 /etc/greetd/config.toml /etc/hostname /etc/issue /etc/issue.net /etc/machine-info /etc/xdg/autostart/aureon-session-ready.desktop /usr/lib/os-release /usr/lib/bootc/kargs.d/20-aureon-desktop-serial.toml /usr/lib/systemd/system/aureon-desktop-ready.service /usr/lib/tmpfiles.d/aureon-desktop-ready.conf && \
-    find /etc/skel/.config /usr/share/color-schemes /usr/share/plasma/desktoptheme/AureonLiquidGlass /usr/share/plasma/look-and-feel/org.aureon.desktop /usr/share/plasma/plasmoids/org.aureon.systemoverview /usr/share/wallpapers/AureonLiquidGlass -type d -exec chmod 0755 {} \; && \
-    find /etc/skel/.config /usr/share/color-schemes /usr/share/plasma/desktoptheme/AureonLiquidGlass /usr/share/plasma/look-and-feel/org.aureon.desktop /usr/share/plasma/plasmoids/org.aureon.systemoverview /usr/share/wallpapers/AureonLiquidGlass -type f -exec chmod 0644 {} \; && \
-    chmod 0755 /usr/libexec/aureon/aureon-baseline /usr/libexec/aureon/aureonctl /usr/libexec/aureon/aureon-apply-appearance /usr/libexec/aureon/aureon-plasma-session /usr/libexec/aureon/aureon-plasma-layout-ready /usr/libexec/aureon/aureon-display /usr/libexec/aureon/aureon-session-ready /usr/libexec/aureon/aureon-wait-desktop-ready /usr/libexec/aureon/aureon-core /usr/libexec/aureon/aureon-services /usr/libexec/aureon/aureon-hardware /usr/libexec/aureon/aureon-driver /usr/libexec/aureon/aureon-resource /usr/libexec/aureon/aureon-integrity /usr/libexec/aureon/aureon-integrityctl && \
+    find /etc/skel/.config /usr/share/color-schemes /usr/share/plasma/desktoptheme/AureonCarbon /usr/share/plasma/desktoptheme/AureonLiquidGlass /usr/share/plasma/look-and-feel/org.aureon.desktop /usr/share/plasma/plasmoids/org.aureon.systemoverview /usr/share/wallpapers/AureonCarbon /usr/share/wallpapers/AureonLiquidGlass -type d -exec chmod 0755 {} \; && \
+    find /etc/skel/.config /usr/share/color-schemes /usr/share/plasma/desktoptheme/AureonCarbon /usr/share/plasma/desktoptheme/AureonLiquidGlass /usr/share/plasma/look-and-feel/org.aureon.desktop /usr/share/plasma/plasmoids/org.aureon.systemoverview /usr/share/wallpapers/AureonCarbon /usr/share/wallpapers/AureonLiquidGlass -type f -exec chmod 0644 {} \; && \
+    chmod 0755 /usr/libexec/aureon/aureon-baseline /usr/libexec/aureon/aureonctl /usr/libexec/aureon/aureon-apply-appearance /usr/libexec/aureon/aureon-plasma-session /usr/libexec/aureon/aureon-plasma-layout-ready /usr/libexec/aureon/aureon-display /usr/libexec/aureon/aureon-session-ready /usr/libexec/aureon/aureon-wait-desktop-ready /usr/libexec/aureon/aureon-core /usr/libexec/aureon/aureon-services /usr/libexec/aureon/aureon-hardware /usr/libexec/aureon/aureon-driver /usr/libexec/aureon/aureon-resource /usr/libexec/aureon/aureon-integrity /usr/libexec/aureon/aureon-integrityctl /usr/libexec/aureon/aureon-laptop-check /usr/libexec/aureon/aureon-update && \
     useradd --create-home --uid 1000 --shell /bin/bash aureon && \
     passwd --lock aureon && \
     install -d -m 0755 /usr/bin && \
-    for command in aureonctl aureon-core aureon-services aureon-hardware aureon-driver aureon-resource aureon-integrity aureon-integrityctl; do ln -s ../libexec/aureon/${command} /usr/bin/${command}; done && \
+    for command in aureonctl aureon-baseline aureon-core aureon-services aureon-hardware aureon-driver aureon-resource aureon-integrity aureon-integrityctl aureon-laptop-check aureon-update; do ln -s ../libexec/aureon/${command} /usr/bin/${command}; done && \
     install -d -m 0755 /usr/lib/systemd/system/multi-user.target.wants && \
     ln -s ../greetd.service /usr/lib/systemd/system/multi-user.target.wants/greetd.service && \
-    ln -s ../aureon-desktop-ready.service /usr/lib/systemd/system/multi-user.target.wants/aureon-desktop-ready.service
+    ln -s ../aureon-desktop-ready.service /usr/lib/systemd/system/multi-user.target.wants/aureon-desktop-ready.service && \
+    ln -s ../bluetooth.service /usr/lib/systemd/system/multi-user.target.wants/bluetooth.service && \
+    ln -s ../switcheroo-control.service /usr/lib/systemd/system/multi-user.target.wants/switcheroo-control.service

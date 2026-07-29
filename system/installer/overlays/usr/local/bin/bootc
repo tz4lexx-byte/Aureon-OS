@@ -1,0 +1,55 @@
+#!/usr/bin/bash
+# Keep bootc's unpack workspace off the memory-backed Live root.
+
+set -u
+
+real_bootc=/usr/bin/bootc
+
+if [[ ${1-} != install || ${2-} != to-filesystem ]]; then
+    exec "${real_bootc}" "$@"
+fi
+
+target=${!#}
+workspace="${target}/var/tmp/aureon-bootc-install"
+
+if ! install -d -m 1777 "${workspace}"; then
+    echo "[Aureon] No se pudo preparar espacio temporal en ${target}." >&2
+    exit 1
+fi
+
+export TMPDIR="${workspace}"
+started=${SECONDS}
+
+echo "[Aureon] Temporales de instalación: ${TMPDIR}"
+echo "[Aureon] Despliegue bootc iniciado; se informará actividad cada 5 segundos."
+
+"${real_bootc}" "$@" &
+bootc_pid=$!
+
+forward_signal() {
+    kill -TERM "${bootc_pid}" 2>/dev/null || true
+}
+trap forward_signal INT TERM HUP
+
+while kill -0 "${bootc_pid}" 2>/dev/null; do
+    read -r used available < <(
+        df -B1 --output=used,avail "${target}" 2>/dev/null | tail -n 1
+    )
+    elapsed=$((SECONDS - started))
+    printf '[Aureon] bootc activo: %ss; destino usado=%s bytes; disponible=%s bytes\n' \
+        "${elapsed}" "${used:-desconocido}" "${available:-desconocido}"
+    sleep 5
+done
+
+wait "${bootc_pid}"
+status=$?
+elapsed=$((SECONDS - started))
+rm -rf --one-file-system "${workspace}"
+
+if (( status == 0 )); then
+    echo "[Aureon] Despliegue bootc completado en ${elapsed}s."
+else
+    echo "[Aureon] Despliegue bootc falló tras ${elapsed}s (código ${status})." >&2
+fi
+
+exit "${status}"

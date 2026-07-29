@@ -51,8 +51,24 @@ while [ "$attempt" -lt 240 ]; do
                 emit_diagnostics
                 exit 1
             fi
+            # Serial output from the kernel and systemd can interleave with a
+            # long write. Emit bounded, numbered chunks three times so the
+            # host can reconstruct a complete report even if one copy of a
+            # chunk is interrupted by an audit message.
             encoded="$(base64 -w 0 < "$report_file")"
-            printf 'AUREON_EVIDENCE %s=%s\n' "$report" "$encoded"
+            chunks=$(((${#encoded} + 511) / 512))
+            index=1
+            while [ "$index" -le "$chunks" ]; do
+                offset=$(((index - 1) * 512))
+                chunk="$(printf '%s' "$encoded" | cut -c "$((offset + 1))-$((offset + 512))")"
+                repeat=1
+                while [ "$repeat" -le 3 ]; do
+                    printf 'AUREON_EVIDENCE_CHUNK name=%s index=%04d total=%04d data=%s\n' \
+                        "$report" "$index" "$chunks" "$chunk"
+                    repeat=$((repeat + 1))
+                done
+                index=$((index + 1))
+            done
         done
         printf 'AUREON_DESKTOP_READY\n'
         exit 0

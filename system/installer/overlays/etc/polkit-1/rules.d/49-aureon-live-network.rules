@@ -1,0 +1,8 @@
+// The disposable Live user may configure networking for hardware tests.
+// This file exists only in the installer image, not in the installed payload.
+polkit.addRule(function(action, subject) {
+    if (subject.user == "aureon" &&
+        action.id.indexOf("org.freedesktop.NetworkManager.") == 0) {
+        return polkit.Result.YES;
+    }
+});
